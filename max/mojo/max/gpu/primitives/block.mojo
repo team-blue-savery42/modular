@@ -108,12 +108,35 @@ def _block_reduce_with_padding[
             # Make sure that the "ghost" warps do not contribute to the
             # reduction.
             var block_val = initial_vals[i]
-            # Load values from the shared memory (ith lane will have ith
-            # warp's value). Account for padding when loading.
-            if lid < n_warps:
-                block_val = shared_mem[
-                    unsafe_offset=i * smem_stride + compute_offset(lid)
-                ]
+
+            comptime if n_warps <= WARP_SIZE:
+                # Load values from the shared memory (ith lane will have ith
+                # warp's value). Account for padding when loading.
+                if lid < n_warps:
+                    block_val = shared_mem[
+                        unsafe_offset=i * smem_stride + compute_offset(lid)
+                    ]
+            else:
+                # More warps than lanes (16-lane warps in a block of more
+                # than 256 threads): one load per lane would drop the warps
+                # past `WARP_SIZE`. Reduce the values `WARP_SIZE` at a time
+                # instead, and give lane `j` the result of group `j`.
+                comptime n_groups = ceildiv(n_warps, WARP_SIZE)
+                comptime assert (
+                    n_groups <= WARP_SIZE
+                ), "Block size must be at most WARP_SIZE**3"
+                comptime for j in range(n_groups):
+                    var group_val = initial_vals[i]
+                    var idx = j * WARP_SIZE + Int(lid)
+                    if idx < n_warps:
+                        group_val = shared_mem[
+                            unsafe_offset=i * smem_stride + compute_offset(idx)
+                        ]
+                    var group_result = warp.broadcast(
+                        warp_reduce_fn[reduction_idx=i](group_val)
+                    )
+                    if Int(lid) == j:
+                        block_val = group_result
 
             # Reduce across the first warp
             warp_results[i] = warp_reduce_fn[reduction_idx=i](block_val)
@@ -731,11 +754,31 @@ def _prefix_sum[
     # Step 3: Have the first warp perform a scan on the warp results
     var lid = lane_id()
     if wid == 0:
-        var previous_warps_prefix = warp.prefix_sum[exclusive=False](
-            warp_mem[unsafe_offset=lid]
-        )
-        if lid < n_warps:
-            warp_mem[unsafe_offset=lid] = previous_warps_prefix
+        comptime if n_warps <= WARP_SIZE:
+            var previous_warps_prefix = warp.prefix_sum[exclusive=False](
+                warp_mem[unsafe_offset=lid]
+            )
+            if lid < n_warps:
+                warp_mem[unsafe_offset=lid] = previous_warps_prefix
+        else:
+            # More warps than lanes (16-lane warps in a block of more than
+            # 256 threads): one value per lane would scan only the first
+            # `WARP_SIZE` warps. Scan them `WARP_SIZE` at a time instead,
+            # carrying each group's total into the next. In a partial last
+            # group the lanes past the last warp scan unset slots, which
+            # only their own results (never read) include.
+            comptime n_groups = ceildiv(n_warps, WARP_SIZE)
+            var carry = Scalar[dtype](0)
+            comptime for j in range(n_groups):
+                var idx = j * WARP_SIZE + Int(lid)
+                var group_prefix = (
+                    warp.prefix_sum[exclusive=False](
+                        warp_mem[unsafe_offset=idx]
+                    )
+                    + carry
+                )
+                warp_mem[unsafe_offset=idx] = group_prefix
+                carry = warp.shuffle_idx(group_prefix, UInt32(WARP_SIZE - 1))
     barrier()
 
     # Step 4: Add the prefix from previous warps
