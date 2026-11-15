@@ -374,6 +374,39 @@ struct CompilationTarget[_mlir_value: _TargetType = _current_target(), //](
         comptime if Self.is_triple["nvptx64-nvidia-cuda"]():
             # TODO: use `is_nvidia_gpu` when moved to into this struct.
             return "target-abi=shortptr"
+        elif Self._is_triple_arch["spirv64"]():
+            # LLVM's SPIR-V backend emits an extension only where it is
+            # allowed, and rejects code that needs one that isn't. These are
+            # the ones Mojo code needs that Intel's driver compiler accepts:
+            # float32/float64 atomics, the `bfloat` type (the Intel
+            # compiler plugin computes bfloat16 in float32), and the device
+            # clock for timers. IGC rejects SPV_EXT_shader_atomic_float16_add,
+            # so a float16 atomic fails to compile with the backend's message
+            # naming it, and SPV_KHR_abort, so `abort()` reports through the
+            # Intel plugins instead of trapping.
+            return (
+                "spirv-ext=+SPV_EXT_shader_atomic_float_add,"
+                "+SPV_EXT_shader_atomic_float_min_max,"
+                "+SPV_KHR_bfloat16,"
+                "+SPV_KHR_shader_clock,"
+                # i128 (float formatting tables, wide multiplies). The Intel
+                # compiler plugin renames it to IGC's older name,
+                # SPV_INTEL_arbitrary_precision_integers.
+                "+SPV_ALTERA_arbitrary_precision_integers,"
+                # A printf format built at run time (the Intel plugin's
+                # debug_assert line), which IGC copies into the printf buffer.
+                "+SPV_EXT_relaxed_printf_string_address_space,"
+                # DPAS (`mma()` on Intel). IGC accepts it although the
+                # driver's list of SPIR-V extensions doesn't name it.
+                "+SPV_INTEL_subgroup_matrix_multiply_accumulate,"
+                # 2D block loads, stores and prefetches
+                # (`max.gpu.memory.block_io_intel`); not listed by the driver
+                # either.
+                "+SPV_INTEL_2d_block_io,"
+                # Split work-group barriers (arrive, then wait), which the
+                # driver lists.
+                "+SPV_INTEL_split_barrier"
+            )
         else:
             return ""
 
