@@ -214,6 +214,17 @@ trait PluginHooks:
     `shuffle` instead.
     """
 
+    comptime lowers_masked_gather_scatter: Bool = True
+    """Whether the backend lowers `llvm.masked.gather` and
+    `llvm.masked.scatter`, which `gather()` and `scatter()` use.
+
+    They take a vector of pointers. Where this is `False`, `gather()` and
+    `scatter()` access each enabled element through its own pointer instead,
+    as on targets whose code can't hold pointers in vectors (SPIR-V for
+    OpenCL without SPV_INTEL_masked_gather_scatter, which Intel's driver
+    compiler doesn't accept).
+    """
+
     comptime cast_fn[src: DType, dst: DType]: OptionalReg[
         _CastPluginHookFnType[dst]
     ] = None

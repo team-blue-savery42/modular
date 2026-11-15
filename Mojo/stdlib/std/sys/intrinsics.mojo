@@ -146,7 +146,9 @@ def gather[
             passthrough[0]
         )
 
-    comptime if is_gpu() and invariant:
+    comptime if (
+        is_gpu() and invariant
+    ) or not CurrentPlugin.lowers_masked_gather_scatter:
         var result = SIMD[dtype, size]()
 
         comptime for i in range(size):
@@ -247,6 +249,15 @@ def scatter[
             )
             ptr.unsafe_store(value[0])
         return
+
+    comptime if not CurrentPlugin.lowers_masked_gather_scatter:
+        comptime for i in range(size):
+            if mask[i]:
+                Pointer[Scalar[dtype], MutUntrackedOrigin](
+                    unsafe_from_address=Int(base[i])
+                ).unsafe_store(value[i])
+        return
+
     llvm_intrinsic["llvm.masked.scatter", NoneType](
         value,
         Pointer(to=base).unsafe_bitcast[
