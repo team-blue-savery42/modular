@@ -1,0 +1,45 @@
+#!/bin/sh
+# ===----------------------------------------------------------------------=== #
+# Copyright (c) 2026, Sean Avery. All rights reserved.
+#
+# Licensed under the Apache License v2.0 with LLVM Exceptions:
+# https://llvm.org/LICENSE.txt
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ===----------------------------------------------------------------------=== #
+
+# Run on the GPU host (after a build of //max/mojo/max:max):
+# compile tests/codegen/targets.mojo through the Intel compiler plugin and check
+# that the Intel targets select the Intel stdlib plugin (is_gpu() is true) and
+# produce a SPIR-V kernel that passes utils/check-spirv.
+set -eu
+here=$(cd "$(dirname "$0")/.." && pwd)
+modular=${MODULAR_DIR:-$(cd "$here/../.." && pwd)}
+plugin=$modular/bazel-bin/plugins/intel/compiler/IntelCompilerPlugin.so
+maxpkg=$(cd "$modular" && ./bazelw cquery --output=files //max/mojo/max:max 2>/dev/null)
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
+mkdir -p "$work/out"
+cd "$work"
+if ! MODULAR_COMPILER_PLUGINS=$plugin MODULAR_CACHE_DIR=$work/cache \
+  "${INTEL_PLUGIN_BIN:-$HOME/.cache/intel-plugin/bin}/mojo" run -I "$modular/$(dirname "$maxpkg")" \
+  "$here/tests/codegen/targets.mojo" >"$work/mojo.log" 2>&1; then
+  cat "$work/mojo.log"
+  echo "FAIL: compiling tests/codegen/targets.mojo"
+  exit 1
+fi
+status=0
+for target in b70 bare; do
+  if grep -q 'store i32 1111' "out/$target.ll" && ! grep -q '2222' "out/$target.ll"; then
+    echo "ok   $target: is_gpu() is true"
+  else
+    echo "FAIL $target: is_gpu() is not true for the Intel target"
+    status=1
+  fi
+done
+"$here/utils/check-spirv" out/b70.spv || status=1
+exit $status
