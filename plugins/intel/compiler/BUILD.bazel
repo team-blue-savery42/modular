@@ -1,0 +1,141 @@
+load("//bazel:api.bzl", "modular_cc_binary", "modular_cc_library", "modular_cc_test")
+
+# Target metadata and the address-space table, shared by the plugin and tests.
+modular_cc_library(
+    name = "IntelTraits",
+    srcs = ["IntelTraits.cpp"],
+    hdrs = [
+        "IntelAddressSpace.h",
+        "IntelTraits.h",
+    ],
+    includes = ["."],
+    deps = [
+        "//Mojo:TargetTraits",
+        "@llvm-project//llvm:Support",
+        "@llvm-project//llvm:TargetParser",
+    ],
+)
+
+# Renumbers address spaces from Mojo to SPIR-V numbering, and the
+# other IR rewrites SPIR-V needs (printf, dynamic shared memory, bfloat16,
+# abort, the device heap, lane masks, aggregate phis, constant memory the
+# host fills, convergent built-ins, 128-bit integers, sub-group sizes).
+modular_cc_library(
+    name = "IntelPasses",
+    srcs = [
+        "RemapAddressSpaces.cpp",
+        "SPIRVBinary.cpp",
+    ],
+    hdrs = [
+        "RemapAddressSpaces.h",
+        "SPIRVBinary.h",
+    ],
+    includes = ["."],
+    deps = [
+        ":IntelTraits",
+        "@llvm-project//llvm:Analysis",
+        "@llvm-project//llvm:Core",
+        "@llvm-project//llvm:Scalar",
+        "@llvm-project//llvm:Support",
+        "@llvm-project//llvm:TransformUtils",
+    ],
+)
+
+# Intel GPU codegen backend, loaded by the Mojo compiler at run time:
+#   MODULAR_COMPILER_PLUGINS=$(bazel-bin)/plugins/intel/compiler/IntelCompilerPlugin.so
+# It returns C++ objects to the compiler, so it must be built from the same
+# commit and configuration as the `mojo` that loads it. It shares `mojo`'s
+# libLLVM, libMLIR and runtime globals (as //Target:CPUPlugin.so does): a
+# static LLVM copy registered its command-line options a second time in
+# libLLVM's registry once upstream linked LLVM dynamically.
+modular_cc_binary(
+    # avoids the `lib` prefix; plugins are not traditional libs
+    name = "IntelCompilerPlugin.so",
+    srcs = [
+        "IntelBackend.cpp",
+        "IntelBackend.h",
+        "IntelLowering.cpp",
+        "IntelLowering.h",
+        "Plugin.cpp",
+    ],
+    dynamic_deps = [
+        "//AsyncRT:RuntimeGlobals",
+        "//Support:Globals",
+        "@llvm-project//clang:clangBasic",
+        "@llvm-project//llvm:LLVM",
+        "//bazel/internal:MLIR",
+    ],
+    linkshared = True,
+    linkstatic = False,
+    visibility = ["//visibility:public"],
+    deps = [
+        ":IntelPasses",
+        ":IntelTraits",
+        "//Mojo:HostBackend",
+        "//Mojo:TargetBackend.headers",
+        "//Mojo:TargetLowering",
+        "//Mojo:TargetTraits",
+        "//Mojo:ToolCommon",
+        "@llvm-project//llvm:BitWriter",
+        "@llvm-project//llvm:Support",
+        "@llvm-project//llvm:TargetParser",
+        "@llvm-project//mlir:IR",
+        "@llvm-project//mlir:LLVMDialect",
+    ],
+)
+
+modular_cc_test(
+    name = "IntelTraitsTest",
+    size = "small",
+    srcs = ["test/IntelTraitsTest.cpp"],
+    deps = [
+        ":IntelTraits",
+        "@llvm-project//llvm:Core",
+        "@llvm-project//llvm:MC",
+        "@llvm-project//llvm:SPIRVCodeGen",
+        "@llvm-project//llvm:SPIRVInfo",
+        "@llvm-project//llvm:Support",
+        "@llvm-project//llvm:Target",
+        "@llvm-project//llvm:TargetParser",
+    ],
+)
+
+modular_cc_test(
+    name = "SPIRVBackendPatchTest",
+    size = "small",
+    srcs = ["test/SPIRVBackendPatchTest.cpp"],
+    deps = [
+        "@llvm-project//llvm:AsmParser",
+        "@llvm-project//llvm:Core",
+        "@llvm-project//llvm:MC",
+        "@llvm-project//llvm:SPIRVCodeGen",
+        "@llvm-project//llvm:SPIRVInfo",
+        "@llvm-project//llvm:Support",
+        "@llvm-project//llvm:Target",
+        "@llvm-project//llvm:TargetParser",
+    ],
+)
+
+modular_cc_test(
+    name = "SPIRVBinaryTest",
+    size = "small",
+    srcs = ["test/SPIRVBinaryTest.cpp"],
+    deps = [":IntelPasses"],
+)
+
+modular_cc_test(
+    name = "RemapAddressSpacesTest",
+    size = "small",
+    srcs = ["test/RemapAddressSpacesTest.cpp"],
+    deps = [
+        ":IntelPasses",
+        "@llvm-project//llvm:AsmParser",
+        "@llvm-project//llvm:Core",
+        "@llvm-project//llvm:MC",
+        "@llvm-project//llvm:SPIRVCodeGen",
+        "@llvm-project//llvm:SPIRVInfo",
+        "@llvm-project//llvm:Support",
+        "@llvm-project//llvm:Target",
+        "@llvm-project//llvm:TargetParser",
+    ],
+)
