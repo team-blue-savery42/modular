@@ -68,6 +68,12 @@ from .coop_row import (
     coop_row_words,
 )
 
+comptime DEFAULT_BLOCK_SIZE = min(
+    1024, DeviceContext[].default_device_info.max_thread_block_size
+)
+"""The default threads per block of the sampling kernels: 1024, or the
+device's limit when that is lower (512 on Intel Xe-LP)."""
+
 # Apple-only `topk_softmax_sample` cache budget. The kernel statically allocates
 # `s_vals` (the top-k cache) plus auxiliary SMEM (`s_count` + block-reduction
 # per-warp scratch). Allocating the full 32K bucket for the cache alone left no
@@ -404,7 +410,7 @@ def TopKMaskLogitsKernel[
 def topk_mask_logits[
     dtype: DType,
     out_idx_type: DType,
-    block_size: Int = 1024,
+    block_size: Int = DEFAULT_BLOCK_SIZE,
     TopKArrLayoutType: TensorLayout = Layout[
         shape_types=Coord[Int64].element_types,
         stride_types=Coord[ComptimeInt[1]].element_types,
@@ -1169,7 +1175,7 @@ def TopKSamplingFromProbKernel[
 def topk_sampling_from_prob[
     dtype: DType,
     out_idx_type: DType,
-    block_size: Int = 1024,
+    block_size: Int = DEFAULT_BLOCK_SIZE,
     TopKArrLayoutType: TensorLayout = Layout[
         shape_types=Coord[Int64].element_types,
         stride_types=Coord[ComptimeInt[1]].element_types,
@@ -2881,7 +2887,7 @@ def TopKTopPSamplingFromProbKernel[
 def topk_topp_sampling_from_prob[
     dtype: DType,
     out_idx_type: DType,
-    block_size: Int = 1024,
+    block_size: Int = DEFAULT_BLOCK_SIZE,
     from_logits: Bool = False,
     emit_dist: Bool = False,
     dist_dtype: DType = .float32,
@@ -3471,7 +3477,7 @@ def topk_softmax_sample_kernel[
 def topk_softmax_sample[
     dtype: DType,
     out_idx_type: DType,
-    block_size: Int = 1024,
+    block_size: Int = DEFAULT_BLOCK_SIZE,
     TopKArrLayoutType: TensorLayout = Layout[
         shape_types=Coord[Int64].element_types,
         stride_types=Coord[ComptimeInt[1]].element_types,
@@ -3934,7 +3940,7 @@ def TopKTopPMaskedProbsKernel[
 
 def topk_topp_masked_probs[
     dtype: DType,
-    block_size: Int = 1024,
+    block_size: Int = DEFAULT_BLOCK_SIZE,
     TopKArrLayoutType: TensorLayout = Layout[
         shape_types=Coord[Int64].element_types,
         stride_types=Coord[ComptimeInt[1]].element_types,

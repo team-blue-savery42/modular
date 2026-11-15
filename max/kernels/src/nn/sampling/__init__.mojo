@@ -40,6 +40,7 @@ from .topk_fi import (
     topk_sampling_from_prob,
     topk_softmax_sample,
 )
+from .topk_fi import DEFAULT_BLOCK_SIZE
 from .topk_fi import topk_topp_masked_probs as _topk_topp_masked_probs_single
 from .topk_fi import (
     topk_topp_sampling_from_prob as _topk_topp_sampling_from_prob_single,
@@ -53,7 +54,7 @@ from .dspark_draft import dspark_draft_sample_gpu
 
 def topk_topp_masked_probs[
     dtype: DType,
-    block_size: Int = 1024,
+    block_size: Int = DEFAULT_BLOCK_SIZE,
     TopKArrLayoutType: TensorLayout = Layout[
         shape_types=Coord[Int64].element_types,
         stride_types=Coord[ComptimeInt[1]].element_types,
@@ -161,7 +162,7 @@ def topk_topp_masked_probs[
 def topk_topp_sampling_from_prob[
     dtype: DType,
     out_idx_type: DType,
-    block_size: Int = 1024,
+    block_size: Int = DEFAULT_BLOCK_SIZE,
     from_logits: Bool = False,
     emit_dist: Bool = False,
     dist_dtype: DType = .float32,
