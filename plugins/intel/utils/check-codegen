@@ -1,0 +1,217 @@
+#!/bin/sh
+# ===----------------------------------------------------------------------=== #
+# Copyright (c) 2026, Sean Avery. All rights reserved.
+#
+# Licensed under the Apache License v2.0 with LLVM Exceptions:
+# https://llvm.org/LICENSE.txt
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ===----------------------------------------------------------------------=== #
+
+# Run on the GPU host (after a build of //max/mojo/max:max):
+# compile the corpus in tests/codegen/kernels.mojo for the B70 target through
+# the Intel compiler plugin, then
+# check each kernel is a SPIR-V kernel entry point with CrossWorkgroup pointer
+# parameters, uses the SPIR-V feature it exists to exercise, and that the binary
+# the backend emitted passes utils/check-spirv (spirv-val and ocloc for
+# bmg-g31). Uses a fresh compile cache so the plugin always runs.
+set -eu
+here=$(cd "$(dirname "$0")/.." && pwd)
+modular=${MODULAR_DIR:-$(cd "$here/../.." && pwd)}
+plugin=$modular/bazel-bin/plugins/intel/compiler/IntelCompilerPlugin.so
+maxpkg=$(cd "$modular" && ./bazelw cquery --output=files //max/mojo/max:max 2>/dev/null)
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
+mkdir -p "$work/out"
+
+cd "$work"
+if ! MODULAR_COMPILER_PLUGINS=$plugin MODULAR_CACHE_DIR=$work/cache \
+  "${INTEL_PLUGIN_BIN:-$HOME/.cache/intel-plugin/bin}/mojo" run -I "$modular/$(dirname "$maxpkg")" \
+  "$here/tests/codegen/kernels.mojo" \
+  >"$work/mojo.log" 2>&1; then
+  cat "$work/mojo.log"
+  echo "FAIL: compiling tests/codegen/kernels.mojo"
+  exit 1
+fi
+
+status=0
+if grep -q 'not a recognized processor' "$work/mojo.log"; then
+  echo "FAIL: the accelerator arch reached LLVM as a CPU name"
+  status=1
+fi
+
+# Each line: a kernel, then a SPIR-V instruction its assembly must contain.
+# Checked on the disassembled binary, which is what the driver will load.
+while read -r kernel feature; do
+  dis=out/$kernel.dis
+  fail() { echo "FAIL $kernel: $1"; status=1; }
+  spirv-dis "out/$kernel.spv" -o "$dis" || fail "spirv-dis failed"
+  grep -q 'OpEntryPoint Kernel' "$dis" || fail "no kernel entry point"
+  grep -q 'OpTypePointer CrossWorkgroup' "$dis" || fail "no CrossWorkgroup pointer"
+  grep -q 'OpExecutionMode .* SubgroupSize 16' "$dis" || fail "sub-group size is not fixed at 16"
+  grep -q -- "$feature" "$dis" || fail "no '$feature'"
+  "$here/utils/check-spirv" "out/$kernel.spv" || fail "check-spirv rejected the binary"
+done <<'EOF'
+store_value OpStore
+load_first OpPtrCastToGeneric
+local_stack OpVariable %_ptr_Function_
+vector_add BuiltIn WorkgroupId
+ids BuiltIn NumWorkgroups
+atomic_count OpAtomicIAdd
+math_kernel OpExtInst
+shared_reduce OpControlBarrier %uint_2 %uint_2 %uint_784
+reverse_shared OpTypePointer Workgroup
+warp_sync OpControlBarrier %uint_3 %uint_3
+aborts LinkageAttributes "__mojo_intel_abort_flag" Export
+zero_tuple OpTypeStruct %uint %ulong
+boxed_pointer OpConvertUToPtr
+divide OpFDiv
+uses_heap LinkageAttributes "__mojo_intel_heap" Export
+heap_exhaust OpAtomicCompareExchange %ulong
+heap_reuse OpAtomicLoad %ulong
+constant_import LinkageAttributes "constant_table" Export
+warp_sum OpGroupNonUniformShuffle
+dpas OpSubgroupMatrixMultiplyAccumulateINTEL
+block_io OpSubgroup2DBlockLoadINTEL
+split_barrier OpControlBarrierArrive
+EOF
+
+# A kernel compiled for the sub-group size 32 variant runs at 32,
+# and its warp.sum is sized for 32: one more butterfly step than at 16.
+spirv-dis out/warp_sum_sg32.spv -o out/warp_sum_sg32.dis || status=1
+if ! grep -q 'OpExecutionMode .* SubgroupSize 32' out/warp_sum_sg32.dis; then
+  echo "FAIL warp_sum_sg32: no OpExecutionMode SubgroupSize 32"
+  status=1
+fi
+if grep -q 'SubgroupSize 16' out/warp_sum_sg32.dis; then
+  echo "FAIL warp_sum_sg32: a kernel is still at sub-group size 16"
+  status=1
+fi
+"$here/utils/check-spirv" out/warp_sum_sg32.spv || {
+  echo "FAIL warp_sum_sg32: check-spirv rejected the binary"
+  status=1
+}
+n16=$(grep -c OpGroupNonUniformShuffle out/warp_sum.dis || true)
+n32=$(grep -c OpGroupNonUniformShuffle out/warp_sum_sg32.dis || true)
+if [ "$n32" -le "$n16" ]; then
+  echo "FAIL warp_sum_sg32: $n32 shuffles at 32, not more than $n16 at 16"
+  status=1
+fi
+if grep -q 'sub-group-size' out/warp_sum_sg32.dis; then
+  echo "FAIL warp_sum_sg32: the plugin's feature reached the SPIR-V"
+  status=1
+fi
+
+# Every id the hooks read reaches a SPIR-V built-in.
+for builtin in LocalInvocationId WorkgroupId WorkgroupSize NumWorkgroups \
+  SubgroupLocalInvocationId; do
+  grep -q "BuiltIn $builtin" out/ids.dis || {
+    echo "FAIL ids: no BuiltIn $builtin"
+    status=1
+  }
+done
+
+# Dynamic shared memory is a trailing Workgroup kernel parameter, not an
+# import the driver can't link (built-in variables are imports too).
+if grep 'LinkageAttributes .* Import' out/reverse_shared.dis |
+  grep -vq '__spirv_BuiltIn'; then
+  echo "FAIL reverse_shared: imports a symbol"
+  status=1
+fi
+if ! grep -q 'OpFunctionParameter %_ptr_Workgroup' out/reverse_shared.dis; then
+  echo "FAIL reverse_shared: no Workgroup kernel parameter"
+  status=1
+fi
+
+# Constant memory the host fills stays in the constant storage class.
+if ! grep -q '%constant_table = OpVariable %_ptr_UniformConstant' \
+  out/constant_import.dis; then
+  echo "FAIL constant_import: the table is not a UniformConstant variable"
+  status=1
+fi
+
+# The heap functions are defined in the module: nothing for the
+# driver to link, and malloc reserves with a device-scope (Scope 1)
+# compare-exchange, never an add, which kept the bytes of failed requests.
+for kernel in uses_heap heap_exhaust heap_reuse; do
+  if grep -E 'LinkageAttributes "(malloc|free|realloc)" Import' \
+    "out/$kernel.dis" >/dev/null; then
+    echo "FAIL $kernel: imports a heap function"
+    status=1
+  fi
+  if ! grep -Eq 'OpAtomicCompareExchange %ulong %[a-z0-9_]+ %uint_1 ' \
+    "out/$kernel.dis"; then
+    echo "FAIL $kernel: malloc's compare-exchange is not device-scope"
+    status=1
+  fi
+  if grep -q 'OpAtomicIAdd' "out/$kernel.dis"; then
+    echo "FAIL $kernel: malloc reserves with an atomic add"
+    status=1
+  fi
+done
+
+# DPAS: each mma() is one instruction with the operand flags of its
+# types, from the extension the spirv64 defaults enable; each signature has
+# its own declaration of the built-in.
+grep -q 'OpCapability SubgroupMatrixMultiplyAccumulateINTEL' out/dpas.dis || {
+  echo "FAIL dpas: no SubgroupMatrixMultiplyAccumulateINTEL capability"
+  status=1
+}
+for flags in MatrixAPackedFloat16INTEL MatrixBPackedFloat16INTEL \
+  MatrixAPackedBFloat16INTEL MatrixCBFloat16INTEL MatrixResultBFloat16INTEL; do
+  grep -q "OpSubgroupMatrixMultiplyAccumulateINTEL .*$flags" out/dpas.dis || {
+    echo "FAIL dpas: no instruction with $flags"
+    status=1
+  }
+done
+n=$(grep -c 'OpSubgroupMatrixMultiplyAccumulateINTEL %' out/dpas.dis || true)
+if [ "$n" -ne 3 ]; then
+  echo "FAIL dpas: $n DPAS instructions, expected 3"
+  status=1
+fi
+
+# 2D block I/O: one instruction per operation, the destination and
+# source arrays private (Function), the matrix global (CrossWorkgroup).
+for cap in Subgroup2DBlockIOINTEL Subgroup2DBlockTransformINTEL \
+  Subgroup2DBlockTransposeINTEL; do
+  grep -q "OpCapability $cap" out/block_io.dis || {
+    echo "FAIL block_io: no $cap capability"
+    status=1
+  }
+done
+for op in Load LoadTransform LoadTranspose Store Prefetch; do
+  n=$(grep -c "OpSubgroup2DBlock${op}INTEL " out/block_io.dis || true)
+  [ "$n" = 1 ] || {
+    echo "FAIL block_io: $n OpSubgroup2DBlock${op}INTEL, expected 1"
+    status=1
+  }
+done
+# Split barriers: one arrive and one wait, work-group scope, under
+# the extension's capability. SPIRV-Tools 2026.4 prints them with the names
+# of SPV_EXT_split_barrier, which took the same opcodes (EXT, not INTEL).
+grep -Eq 'OpCapability SplitBarrier(INTEL|EXT)$' out/split_barrier.dis &&
+  grep -q 'OpExtension "SPV_INTEL_split_barrier"' out/split_barrier.dis || {
+  echo "FAIL split_barrier: no SPV_INTEL_split_barrier capability or extension"
+  status=1
+}
+for op in Arrive Wait; do
+  n=$(grep -Ec "OpControlBarrier${op}(INTEL|EXT) %uint_2 %uint_2 " out/split_barrier.dis)
+  [ "$n" = 1 ] || {
+    echo "FAIL split_barrier: $n OpControlBarrier${op}, expected 1"
+    status=1
+  }
+done
+if grep -q 'OpTypePointer Generic' out/block_io.dis; then
+  echo "FAIL block_io: a generic pointer (the operands are global and private)"
+  status=1
+fi
+
+if ! grep -q 'OpVariable .* Workgroup' out/shared_reduce.dis; then
+  echo "FAIL shared_reduce: shared memory is not a Workgroup variable"
+  status=1
+fi
+exit $status

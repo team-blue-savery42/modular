@@ -1,0 +1,46 @@
+; exported_function(p): p[0] = mojo_intel_exported(p[1]) = p[1] + p[1], where
+; mojo_intel_exported is a function the module exports. Its name is exported,
+; so the driver plugin's "global_address:mojo_intel_exported" property must
+; not say "no such global" when Level Zero fails to find a global by that
+; name: it reports the failure (test `GlobalLookupFailuresAreReported`).
+; Assembled with
+;   spirv-as tests/codegen/exported_function.spvasm \
+;     -o plugins/intel/driver/test/data/exported_function.spv
+               OpCapability Kernel
+               OpCapability Addresses
+               OpCapability Int64
+               OpCapability Int8
+               OpCapability Linkage
+               OpMemoryModel Physical64 OpenCL
+               OpEntryPoint Kernel %kernel "exported_function"
+               OpExecutionMode %kernel ContractionOff
+               OpName %kernel "exported_function"
+               OpName %exported "mojo_intel_exported"
+               OpDecorate %p Alignment 4
+               OpDecorate %exported LinkageAttributes "mojo_intel_exported" Export
+      %uchar = OpTypeInt 8 0
+%_ptr_CrossWorkgroup_uchar = OpTypePointer CrossWorkgroup %uchar
+       %void = OpTypeVoid
+ %kernel_type = OpTypeFunction %void %_ptr_CrossWorkgroup_uchar
+      %float = OpTypeFloat 32
+   %fn_type = OpTypeFunction %float %float
+%_ptr_CrossWorkgroup_float = OpTypePointer CrossWorkgroup %float
+      %ulong = OpTypeInt 64 0
+    %ulong_4 = OpConstant %ulong 4
+   %exported = OpFunction %float None %fn_type
+          %x = OpFunctionParameter %float
+       %body = OpLabel
+     %double = OpFAdd %float %x %x
+               OpReturnValue %double
+               OpFunctionEnd
+     %kernel = OpFunction %void None %kernel_type
+          %p = OpFunctionParameter %_ptr_CrossWorkgroup_uchar
+      %entry = OpLabel
+     %second = OpInBoundsPtrAccessChain %_ptr_CrossWorkgroup_uchar %p %ulong_4
+    %secondf = OpBitcast %_ptr_CrossWorkgroup_float %second
+          %v = OpLoad %float %secondf Aligned 4
+          %e = OpFunctionCall %float %exported %v
+     %firstf = OpBitcast %_ptr_CrossWorkgroup_float %p
+               OpStore %firstf %e Aligned 4
+               OpReturn
+               OpFunctionEnd

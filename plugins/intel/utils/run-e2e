@@ -1,0 +1,81 @@
+#!/bin/sh
+# ===----------------------------------------------------------------------=== #
+# Copyright (c) 2026, Sean Avery. All rights reserved.
+#
+# Licensed under the Apache License v2.0 with LLVM Exceptions:
+# https://llvm.org/LICENSE.txt
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ===----------------------------------------------------------------------=== #
+
+# Run on the GPU host (after a build of //max/mojo/max:max and both Intel
+# plugins): runs tests/e2e/NAME.mojo on the B70 through the HAL client API, with
+# our compiler plugin building the kernels and our Level Zero driver plugin
+# running them. Usage: utils/run-e2e [NAME [MOJO-OPTION...]] (default
+# vector_add); options such as -D ASSERT=all go to mojo run before the file. A
+# probe with the line "# run-e2e: device-context" uses MAX's DeviceContext over
+# the HAL (the compat layer, as utils/check-max-gpu runs MAX's tests; build
+# //max/mojo/max/_driver/max_license:max with --//:hal_device_context=true). A
+# line "# run-e2e: packages LABEL..." adds those Mojo packages' directories, and
+# their Mojo dependencies', to the include path (build them first, with the same
+# flag for a device-context probe). E2E_ACCELERATOR overrides the target
+# accelerator (default intel:bmg-g31; intel:bmg-g31-sg32 runs every kernel at
+# sub-group size 32). INTEL_BUNDLE names a utils/make-bundle tree on a machine
+# without Bazel: its mojo runs the probe, with the kernel packages and MAX's
+# HAL packages already on its import path.
+set -eu
+here=$(cd "$(dirname "$0")/.." && pwd)
+modular=${MODULAR_DIR:-$(cd "$here/../.." && pwd)}
+name=${1:-vector_add}
+[ $# -gt 0 ] && shift
+accelerator=${E2E_ACCELERATOR:-intel:bmg-g31}
+# DeviceContext asks for the target's API by name (GPUInfo.api).
+api=intel
+hal=
+if grep -qx "# run-e2e: device-context" "$here/tests/e2e/$name.mojo"; then
+  api=level_zero
+  hal=--//:hal_device_context=true
+fi
+if [ -n "${INTEL_BUNDLE:-}" ]; then
+  export MODULAR_DRIVER_PLUGINS="$api@$INTEL_BUNDLE/plugins/LevelZeroPlugin.so"
+  work=$(mktemp -d)
+  trap 'rm -rf "$work"' EXIT
+  export MODULAR_CACHE_DIR=$work/cache
+  cd "$work"
+  exec "$INTEL_BUNDLE/bin/mojo" run --target-accelerator="$accelerator" \
+    -I "$here/tests/e2e" "$@" "$here/tests/e2e/$name.mojo"
+fi
+if [ "$api" = level_zero ]; then
+  maxpkg=$(cd "$modular" && ./bazelw cquery $hal \
+    --output=files //max/mojo/max/_driver/max_license:max 2>/dev/null)
+else
+  maxpkg=$(cd "$modular" && ./bazelw cquery --output=files //max/mojo/max:max 2>/dev/null)
+fi
+includes="-I $modular/$(dirname "$maxpkg")"
+labels=$(sed -n 's/^# run-e2e: packages //p' "$here/tests/e2e/$name.mojo")
+if [ -n "$labels" ]; then
+  # The packages and the Mojo packages they depend on, as check-max-gpu
+  # finds them (std is built into mojo; //max/mojo/max:max is the legacy
+  # DeviceContext the compat package overlays).
+  # shellcheck disable=SC2086 # $hal and $labels are lists of words.
+  query="kind('mojo_library', deps($(echo $labels | sed 's/ / + /g')))"
+  query="$query except //Mojo/stdlib/std:std except //max/mojo/max:max"
+  for f in $(cd "$modular" && ./bazelw cquery $hal --output=files \
+    "$query" 2>/dev/null); do
+    case $f in external/*) continue ;; esac
+    includes="$includes -I $modular/$(dirname "$f")"
+  done
+fi
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
+export MODULAR_COMPILER_PLUGINS=$modular/bazel-bin/plugins/intel/compiler/IntelCompilerPlugin.so
+export MODULAR_DRIVER_PLUGINS="$api@$modular/bazel-bin/plugins/intel/driver/LevelZeroPlugin.so"
+export MODULAR_CACHE_DIR=$work/cache
+cd "$work"
+# shellcheck disable=SC2086 # $includes is a list of words.
+exec "${INTEL_PLUGIN_BIN:-$HOME/.cache/intel-plugin/bin}/mojo" run --target-accelerator="$accelerator" \
+  -I "$here/tests/e2e" $includes "$@" "$here/tests/e2e/$name.mojo"

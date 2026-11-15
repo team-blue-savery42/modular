@@ -1,0 +1,136 @@
+#!/bin/sh
+# ===----------------------------------------------------------------------=== #
+# Copyright (c) 2026, Sean Avery. All rights reserved.
+#
+# Licensed under the Apache License v2.0 with LLVM Exceptions:
+# https://llvm.org/LICENSE.txt
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ===----------------------------------------------------------------------=== #
+# Run on the build host: packs an optimized MAX build with the Intel plugins
+# into a self-contained directory that runs on another Linux x86-64 machine
+# with an Intel GPU, without Bazel. Usage: utils/make-bundle OUTDIR
+#
+# OUTDIR/runfiles  the runfiles tree of //max/python/max/_entrypoints:pipelines
+#                  (--compilation_mode=opt --//:hal_device_context=true),
+#                  symlinks resolved; rsync keeps a later refresh incremental.
+# OUTDIR/plugins   IntelCompilerPlugin.so, LevelZeroPlugin.so, CPUPlugin.so.
+# OUTDIR/bin/max-python SCRIPT.py [ARG...]
+#                  runs SCRIPT (an absolute path) with MAX's hermetic Python,
+#                  its packages and the plugins, as utils/run-max-py does.
+# OUTDIR/bin/mojo  the mojo of that build, with the stdlib and the kernel
+#                  packages on its import path, the Intel plugins, and the
+#                  caller's working directory.
+# OUTDIR/lib/libmax.so
+#                  a link to the runfiles' libmax.so, where MAX looks for it.
+# OUTDIR/bin/env.sh
+#                  the plugin variables alone, for other programs.
+# Copy OUTDIR with rsync -a (or tar) to the target machine; it only needs
+# the Level Zero loader and Intel's compute runtime.
+set -eu
+[ $# -eq 1 ] || { echo "usage: $0 OUTDIR" >&2; exit 2; }
+out=$1
+modular=${MODULAR_DIR:-$(cd "$(dirname "$0")/../../.." && pwd)}
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
+flags="--compilation_mode=opt --symlink_prefix=/dev/null"
+# shellcheck disable=SC2086 # $flags is a list of words.
+(cd "$modular" && ./bazelw build $flags //plugins/intel/compiler:IntelCompilerPlugin.so \
+  //plugins/intel/driver:LevelZeroPlugin.so //Target:CPUPlugin.so > "$work/plugins.log" 2>&1) ||
+  { cat "$work/plugins.log" >&2; exit 1; }
+# shellcheck disable=SC2086 # $flags is a list of words.
+(cd "$modular" && ./bazelw run $flags --//:hal_device_context=true \
+  --script_path="$work/launch.sh" //max/python/max/_entrypoints:pipelines \
+  > "$work/build.log" 2>&1) || { cat "$work/build.log" >&2; exit 1; }
+# shellcheck disable=SC2086 # $flags is a list of words.
+bin=$(cd "$modular" && ./bazelw info $flags output_path 2>/dev/null)/mojo_host_platform-opt/bin
+launcher=$(sed -n 's#^  \(/.*/pipelines\) "\$@"$#\1#p' "$work/launch.sh")
+runfiles=$launcher.runfiles
+[ -d "$runfiles" ] || { echo "make-bundle: no runfiles at $runfiles" >&2; exit 1; }
+imports=$(sed -n "s/^  python_imports = '\(.*\)'$/\1/p" "$launcher")
+python=rules_python++python+python_3_13_x86_64-unknown-linux-gnu/bin/python3
+[ -x "$runfiles/$python" ] || { echo "make-bundle: no hermetic python in $runfiles" >&2; exit 1; }
+
+mkdir -p "$out/bin" "$out/plugins"
+# The tree, symlinks resolved (Bazel's runfiles are links into the output
+# base and the source tree). Hard links in the source are copied once.
+rsync -aL --delete --delete-excluded --exclude '__pycache__' \
+  "$runfiles/" "$out/runfiles/"
+cp -L "$bin/plugins/intel/compiler/IntelCompilerPlugin.so" \
+  "$bin/plugins/intel/driver/LevelZeroPlugin.so" \
+  "$bin/Target/CPUPlugin.so" "$out/plugins/"
+chmod u+w "$out/plugins"/*.so
+# Outside Bazel, isMaxInstalled() (Support/lib/Configuration.cpp) looks for
+# <max.package_root>/lib/libmax.so, and max.package_root is the bundle.
+mkdir -p "$out/lib"
+ln -sfn ../runfiles/_main/max/lib/max_license/libmax.so "$out/lib/libmax.so"
+[ -e "$out/lib/libmax.so" ] || { echo "make-bundle: no libmax.so in the runfiles" >&2; exit 1; }
+
+# The launcher's environment, with the runfiles-relative paths kept: it cds
+# into runfiles/_main as Bazel's does. `root` is resolved when it runs.
+{
+  echo '#!/bin/sh'
+  echo '# The Intel plugins of this bundle, for programs that run from elsewhere.'
+  echo 'root=$(cd "$(dirname "$0")/.." && pwd)'
+  echo 'export MODULAR_COMPILER_PLUGINS=$root/plugins/IntelCompilerPlugin.so'
+  echo '# The HAL form; a caller may preset the legacy form ("intel@...so").'
+  echo 'export MODULAR_DRIVER_PLUGINS=${MODULAR_DRIVER_PLUGINS:-"level_zero@$root/plugins/LevelZeroPlugin.so;CPU@$root/plugins/CPUPlugin.so"}'
+  echo 'export MODULAR_CRASH_REPORTING_ENABLED=0'
+  echo 'export HF_HUB_OFFLINE=${HF_HUB_OFFLINE:-1}'
+} > "$out/bin/env.sh"
+
+pythonpath=$(echo "$imports" | tr ':' '\n' | sed 's#^#$root/runfiles/#' | paste -sd:)
+{
+  echo '#!/bin/bash'
+  echo '# MAX'"'"'s hermetic Python with its packages and the Intel plugins.'
+  echo '# Usage: max-python SCRIPT.py [ARG...] (SCRIPT an absolute path).'
+  echo 'root=$(cd "$(dirname "$0")/.." && pwd)'
+  echo '. "$root/bin/env.sh"'
+  echo 'export MODULAR_CACHE_DIR=${MODULAR_CACHE_DIR:-$root/cache}'
+  # Bazel's script: `cd <runfiles>/_main && \` then `exec env ... <launcher> "$@"`.
+  sed -e "s#^cd $runfiles/_main && \\\\\$#cd \"\$root/runfiles/_main\" \&\& \\\\#" \
+      -e 's#BUILD_WORKING_DIRECTORY=[^ ]*#BUILD_WORKING_DIRECTORY="$PWD"#' \
+      -e 's#BUILD_WORKSPACE_DIRECTORY=[^ ]*#BUILD_WORKSPACE_DIRECTORY="$root/runfiles/_main"#' \
+      -e 's#BUILD_EXECROOT=[^ ]*#BUILD_EXECROOT="$root/runfiles/_main"#' \
+      -e "s#^  $launcher \"\$@\"\$#  RUNFILES_DIR=\"\$root/runfiles\" PYTHONPATH=$pythonpath \"\$root/runfiles/$python\" -u \"\$@\"#" \
+      "$work/launch.sh" | grep -v '^#!'
+} > "$out/bin/max-python"
+grep -q 'python3" -u' "$out/bin/max-python" || {
+  echo "make-bundle: launcher format changed" >&2; exit 1; }
+grep -q '^cd "\$root' "$out/bin/max-python" || {
+  echo "make-bundle: launcher's cd line changed" >&2; exit 1; }
+
+# mojo: the same variables, every runfiles-relative path made absolute, the
+# caller's working directory kept, the shared libraries of the linker
+# settings too (mojo warns about each one it can't find).
+main='$root/runfiles/_main'
+{
+  echo '#!/bin/bash'
+  echo '# The mojo of this bundle with the Intel plugins. Usage: mojo run FILE.mojo'
+  echo 'root=$(cd "$(dirname "$0")/.." && pwd)'
+  echo '. "$root/bin/env.sh"'
+  echo 'export MODULAR_CACHE_DIR=${MODULAR_CACHE_DIR:-$root/cache}'
+  sed -e "\#^cd $runfiles/_main && \\\\\$#d" \
+      -e "s#MODULAR_MOJO_MAX_IMPORT_PATH=\([^ ]*\)#MODULAR_MOJO_MAX_IMPORT_PATH=\"\$(echo '\1' | sed \"s|^|$main/|;s|,|,$main/|g\")\"#" \
+      -e "s#MODULAR_MOJO_MAX_COMPILERRT_PATH=#MODULAR_MOJO_MAX_COMPILERRT_PATH=$main/#" \
+      -e "s#MODULAR_MOJO_MAX_DRIVER_PATH=#MODULAR_MOJO_MAX_DRIVER_PATH=$main/#" \
+      -e "s#MODULAR_MOJO_MAX_LLD_PATH=#MODULAR_MOJO_MAX_LLD_PATH=$main/#" \
+      -e "s#MODULAR_MOJO_MAX_LINKER_DRIVER=#MODULAR_MOJO_MAX_LINKER_DRIVER=$main/#" \
+      -e "s#LLDB_DEBUGSERVER_PATH=#LLDB_DEBUGSERVER_PATH=$main/#" \
+      -e "s#LLVM_SYMBOLIZER_PATH=#LLVM_SYMBOLIZER_PATH=$main/#" \
+      -e "s#\([=,]\)_solib_k8/#\1$main/_solib_k8/#g" \
+      -e 's#BUILD_WORKING_DIRECTORY=[^ ]*#BUILD_WORKING_DIRECTORY="$PWD"#' \
+      -e 's#BUILD_WORKSPACE_DIRECTORY=[^ ]*#BUILD_WORKSPACE_DIRECTORY="$root/runfiles/_main"#' \
+      -e 's#BUILD_EXECROOT=[^ ]*#BUILD_EXECROOT="$root/runfiles/_main"#' \
+      -e "s#^  $launcher \"\$@\"\$#  $main/Mojo/tools/mojo/mojo \"\$@\"#" \
+      "$work/launch.sh" | grep -v '^#!'
+} > "$out/bin/mojo"
+grep -q 'Mojo/tools/mojo/mojo "\$@"' "$out/bin/mojo" || {
+  echo "make-bundle: mojo launcher format changed" >&2; exit 1; }
+chmod +x "$out/bin/max-python" "$out/bin/mojo" "$out/bin/env.sh"
+git -C "$modular" rev-parse HEAD > "$out/COMMIT"
+echo "bundle: $out ($(du -sh "$out" | cut -f1), commit $(cut -c1-12 "$out/COMMIT"))"
