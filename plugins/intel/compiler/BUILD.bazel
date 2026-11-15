@@ -26,6 +26,7 @@ modular_cc_library(
         "Abort.cpp",
         "ConstantMemory.cpp",
         "Convergent.cpp",
+        "DynamicSharedMemory.cpp",
         "Heap.cpp",
         "RemapAddressSpaces.cpp",
         "SPIRVBinary.cpp",
@@ -35,6 +36,7 @@ modular_cc_library(
         "Abort.h",
         "ConstantMemory.h",
         "Convergent.h",
+        "DynamicSharedMemory.h",
         "Heap.h",
         "RemapAddressSpaces.h",
         "SPIRVBinary.h",
@@ -144,6 +146,18 @@ modular_cc_test(
         "@llvm-project//llvm:AsmParser",
         "@llvm-project//llvm:Core",
         "@llvm-project//llvm:Passes",
+        "@llvm-project//llvm:Support",
+    ],
+)
+
+modular_cc_test(
+    name = "DynamicSharedMemoryTest",
+    size = "small",
+    srcs = ["test/DynamicSharedMemoryTest.cpp"],
+    deps = [
+        ":IntelPasses",
+        "@llvm-project//llvm:AsmParser",
+        "@llvm-project//llvm:Core",
         "@llvm-project//llvm:Support",
     ],
 )
