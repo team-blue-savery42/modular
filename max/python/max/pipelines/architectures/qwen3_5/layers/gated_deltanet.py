@@ -491,18 +491,28 @@ class GatedDeltaNet(Module, Shardable):
         K = self.conv_kernel_size
 
         # ---- Projections (all tokens, fully parallel) ----
+        projection = self.in_proj(x)
         if self.in_proj_ba is None:
             qkv, z, b_proj, a_proj = ops.split(
-                self.in_proj(x),
+                projection,
                 [self.conv_dim, self.value_dim, nv, nv],
                 axis=-1,
             )
         else:
             qkv, z = ops.split(
-                self.in_proj(x), [self.conv_dim, self.value_dim], axis=-1
+                projection, [self.conv_dim, self.value_dim], axis=-1
             )
             b_proj, a_proj = ops.split(self.in_proj_ba(x), [nv, nv], axis=-1)
-        qkv_f32 = ops.cast(qkv, DType.float32)  # [N, conv_dim]
+        # On Intel the conv kernel reads the QKV columns of the projection in
+        # place and applies the activation, instead of a float32 copy and a
+        # separate activation kernel (a copy of the columns and two more
+        # passes over [N, conv_dim] in float32).
+        fused_conv = (
+            accelerator_api() == "level_zero"
+            and verify_width is None
+            and replay_capture is None
+        )
+        qkv_f32 = projection if fused_conv else ops.cast(qkv, DType.float32)
 
         # ---- Decay / beta params ----
         dt_bias = ops.cast(self.dt_bias.to(device), DType.float32)
@@ -548,6 +558,7 @@ class GatedDeltaNet(Module, Shardable):
                 conv_state=conv_pool,
                 slot_idx=conv_slot_uint32,
                 input_row_offsets=offsets_uint32,
+                silu=fused_conv,
             )
         else:
             conv_output_ragged, qkv_window = gated_delta_conv1d_verify_fwd(
@@ -559,7 +570,8 @@ class GatedDeltaNet(Module, Shardable):
                 verify_width=verify_width,
                 rollback=False,
             )
-        conv_output_ragged = ops.silu(conv_output_ragged)
+        if not fused_conv:
+            conv_output_ragged = ops.silu(conv_output_ragged)
 
         if replay_capture is not None:
             replay_capture.append(
