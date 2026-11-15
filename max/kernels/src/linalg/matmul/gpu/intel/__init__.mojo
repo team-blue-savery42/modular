@@ -13,9 +13,16 @@
 
 # ===----------------------------------------------------------------------=== #
 # ===----------------------------------------------------------------------=== #
-"""Intel GPU (Xe2) matmul kernels: DPAS with 2D block I/O."""
+"""Intel GPU matmul kernels: DPAS with 2D block I/O on Xe2, a shared-memory
+SIMT GEMM on the GPUs without DPAS."""
 
 from .dispatch import matmul_dispatch_intel, matmul_f8_dispatch_intel
+from .simt import (
+    SIMT_THREADS,
+    simt_grid,
+    simt_kernel_fn,
+    simt_supported,
+)
 from .matmul import (
     K_STEP,
     SKINNY_MAX_M,
