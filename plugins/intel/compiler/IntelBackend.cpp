@@ -21,6 +21,7 @@
 
 #include "IntelBackend.h"
 
+#include "Abort.h"
 #include "Convergent.h"
 #include "IntelAddressSpace.h"
 #include "IntelTraits.h"
@@ -134,6 +135,8 @@ public:
       return;
     }
     trace("backend: renumbered address spaces for SPIR-V");
+    if (defineAbort(module))
+      trace("backend: defined __mojo_intel_abort");
   }
 
   ErrorOr<BufferRef> emitAssembly(llvm::Module &module,
@@ -188,6 +191,8 @@ protected:
     expandGlobalAddressSpaceCasts(module);
     retypeAggregatePointers(module);
     flattenZeroLengthArrayGEPs(module);
+    dropUnusedAbortFlag(module);
+    returnAfterAbort(module);
     return llvm::Error::success();
   }
 
