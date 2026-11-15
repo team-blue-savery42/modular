@@ -29,6 +29,7 @@ from typing import Any, ParamSpec, TypeVar, cast
 import numpy as np
 from max._core.dialects import builtin, kgen, mo
 from max.driver import (
+    Accelerator,
     Device,
     accelerator_api,
     accelerator_architecture_name,
@@ -12459,6 +12460,54 @@ def _apple_weight_only_scaled_float8_matmul(
     return result
 
 
+def _intel_weight_only_scaled_float8_matmul(
+    a: TensorValue,
+    b: TensorValue,
+    weight_scale: TensorValue,
+) -> TensorValue:
+    """Intel weight-only FP8 (W8A16) matmul: ``(a @ dequant(b).T) * scale``.
+
+    The Intel sibling of :func:`_apple_weight_only_scaled_float8_matmul`:
+    Xe2 has no FP8 matrix type, so the activation ``a`` stays ``bfloat16`` and
+    the FP8-E4M3 weight ``b`` is widened to bfloat16 in registers; the
+    modelopt per-tensor scalar ``weight_scale`` (on the CPU) multiplies the
+    float32 accumulators inside the kernel (``input_scale`` cancels for a
+    bf16 activation).
+
+    Args:
+        a: The bf16 activation, shape ``[M, K]``.
+        b: The FP8 weight, ``float8_e4m3fn`` shape ``[N, K]``.
+        weight_scale: The per-tensor weight scale, shape ``[]`` or ``[1]``.
+
+    Returns:
+        The scaled matmul result in ``bfloat16``, shape ``[M, N]``.
+    """
+    if a.rank != 2 or b.rank != 2:
+        raise ValueError("Both a and b must be rank 2 tensors")
+    if a.dtype != DType.bfloat16:
+        raise ValueError(f"activation a must be bfloat16, got {a.dtype}")
+    if b.dtype != DType.float8_e4m3fn:
+        raise ValueError(f"weight b must be float8_e4m3fn, got {b.dtype}")
+    if a.shape[1] != b.shape[1]:
+        raise ValueError("a and b must share the K dimension (a[M,K], b[N,K])")
+    if weight_scale.shape not in [[], [1]]:
+        raise ValueError(
+            f"expected a scalar weight_scale, got shape {weight_scale.shape}"
+        )
+    return ops.custom(
+        "mo.matmul.weight.only.scaled.float8.intel",
+        device=a.device,
+        values=[a, b, weight_scale.to(DeviceRef.CPU()).reshape([])],
+        out_types=[
+            TensorType(
+                dtype=DType.bfloat16,
+                shape=[a.shape[0], b.shape[0]],
+                device=a.device,
+            )
+        ],
+    )[0].tensor
+
+
 def _apple_int8_w8a8_matmul(
     a: TensorValue,
     b: TensorValue,
@@ -13263,6 +13312,39 @@ def _is_apple_gpu() -> bool:
     """Checks if the current accelerator is an Apple (Metal) GPU."""
     try:
         return accelerator_api() == "metal"
+    except Exception:
+        return False
+
+
+@functools.cache
+def _is_intel_xe2_gpu() -> bool:
+    """Checks if the current accelerator is an Intel Xe2 GPU (Battlemage).
+
+    Xe2 has the DPAS matrix units the Intel FP8 kernels need; the integrated
+    Xe-LP and Xe-LPG GPUs have none.
+    """
+    try:
+        return _is_intel_gpu() and Accelerator().architecture_name.startswith(
+            "bmg-"
+        )
+    except Exception:
+        return False
+
+
+@functools.cache
+def _is_intel_gpu() -> bool:
+    """Checks if the current accelerator is an Intel (Level Zero) GPU.
+
+    The HAL runtime reports a plugin device's API to Python as the API it
+    was asked for ("gpu"), so an Intel device is also recognized by its name
+    (Level Zero's device names start with "Intel").
+    """
+    try:
+        if accelerator_api() == "level_zero":
+            return True
+        return accelerator_count() > 0 and Accelerator().model_name.startswith(
+            "Intel"
+        )
     except Exception:
         return False
 

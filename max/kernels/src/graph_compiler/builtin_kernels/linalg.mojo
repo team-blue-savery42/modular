@@ -65,6 +65,7 @@ from linalg.matmul.gpu.amd.smallm_streaming_matmul import (
 )
 from linalg.matmul.gpu.apple.fp4_matmul import enqueue_apple_fp4_matmul
 from linalg.matmul.gpu.apple.fp8_gemv import enqueue_apple_fp8_matmul
+from linalg.matmul.gpu.intel import matmul_f8_dispatch_intel
 from linalg.matmul.gpu.apple.int8_matmul import (
     enqueue_apple_int8_matmul,
     enqueue_apple_int8_quantize_activation,
@@ -2111,6 +2112,54 @@ struct Struct_matmul_weight_only_scaled_float8_apple:
             b.to_tile_tensor[.float8_e4m3fn](),
             context,
         )
+
+
+@extensibility.register("mo.matmul.weight.only.scaled.float8.intel")
+struct Struct_matmul_weight_only_scaled_float8_intel:
+    """Intel weight-only FP8 (W8A16) matmul: `out = (a @ dequant(b)^T) *
+    weight_scale`.
+
+    The Intel sibling of `mo.matmul.weight.only.scaled.float8.apple`: Xe2's
+    DPAS has no 8-bit float type, so the activation `a` stays bf16 and the
+    FP8-E4M3 weight `b` (`(N, K)`) is widened to bf16 in registers
+    (`linalg.matmul.gpu.intel`'s FP8 kernels); the modelopt per-tensor scalar
+    `weight_scale` (a CPU scalar) is applied to the float32 accumulators, and
+    `input_scale` cancels for a bf16 activation, so it is not an input.
+    """
+
+    @inline(.always)
+    @staticmethod
+    def execute[
+        scale_type: DType,
+    ](
+        c: Some[Output & Tensor],
+        a: Some[Input & Tensor],
+        b: Some[Input & Tensor],
+        weight_scale: Scalar[scale_type],
+        context: DeviceContext,
+    ) raises:
+        comptime assert conforms_to(type_of(c), TileTensorable)
+        comptime assert conforms_to(type_of(a), TileTensorable)
+        comptime assert conforms_to(type_of(b), TileTensorable)
+        comptime assert (
+            context.target.is_gpu()
+        ), "Intel weight-only scaled FP8 matmul only supports GPUs"
+        comptime assert context.default_device_info.api == "level_zero", (
+            "mo.matmul.weight.only.scaled.float8.intel requires an Intel"
+            " (Level Zero) GPU accelerator"
+        )
+        if not matmul_f8_dispatch_intel(
+            c.to_tile_tensor(),
+            a.to_tile_tensor[.bfloat16](),
+            b.to_tile_tensor[.float8_e4m3fn](),
+            weight_scale.cast[DType.float32](),
+            context,
+        ):
+            raise Error(
+                "mo.matmul.weight.only.scaled.float8.intel: shape or layout"
+                " not supported (N, K multiples of 8 and 16, N >= 32, K >= 64,"
+                " row-major tensors)"
+            )
 
 
 @inline(.always)
