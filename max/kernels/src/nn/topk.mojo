@@ -1212,17 +1212,50 @@ def _block_reduce_topk[
 
     # Load warp results into final warp for block-level reduction
     var block_accum = TopK_2[T, ascending]()
-    var thread_in_final_warp = thread_idx.x < ufloordiv(block_dim.x, WARP_SIZE)
-    if thread_in_final_warp:
-        var p_idx = p_sram[lane_id() * p_width]  # loaded value is a scalar
-        block_accum = TopK_2[T, ascending](
-            p=Int(p_idx),  # Convert back to int
-            u=u_sram[lane_id() * u_width],
+    comptime if num_warps_needed <= WARP_SIZE:
+        var thread_in_final_warp = thread_idx.x < ufloordiv(
+            block_dim.x, WARP_SIZE
         )
+        if thread_in_final_warp:
+            var p_idx = p_sram[lane_id() * p_width]  # loaded value is a scalar
+            block_accum = TopK_2[T, ascending](
+                p=Int(p_idx),  # Convert back to int
+                u=u_sram[lane_id() * u_width],
+            )
+        else:
+            # Initialize unused threads with dummy values
+            block_accum.p = 0
+            block_accum.u = _topk_dead_val[T, ascending]()
     else:
-        # Initialize unused threads with dummy values
+        # More warps than lanes (a 1024-thread block of 16-wide sub-groups
+        # on Intel GPUs: 64 partial results): each lane of the first warp
+        # folds in every WARP_SIZE-th partial, so the final warp reduction
+        # sees all of them, not only the first WARP_SIZE. A lane's first
+        # partial is taken as it is (a dead value with a real index stays).
         block_accum.p = 0
         block_accum.u = _topk_dead_val[T, ascending]()
+        if warp == 0:
+            var active_warps = ufloordiv(block_dim.x, WARP_SIZE)
+            comptime per_lane = (num_warps_needed + WARP_SIZE - 1) // WARP_SIZE
+            comptime for j in range(per_lane):
+                var slot = lane_id() + j * WARP_SIZE
+                if slot < active_warps:
+                    var other = TopK_2[T, ascending](
+                        p=Int(p_sram[slot * p_width]),
+                        u=u_sram[slot * u_width],
+                    )
+                    comptime if j == 0:
+                        block_accum = other
+                    elif ascending:
+                        if other.u > block_accum.u or (
+                            other.u == block_accum.u and other.p < block_accum.p
+                        ):
+                            block_accum = other
+                    else:
+                        if other.u < block_accum.u or (
+                            other.u == block_accum.u and other.p < block_accum.p
+                        ):
+                            block_accum = other
 
     # Perform final warp-level reduction for block result
     return _warp_reduce_topk[T, ascending](block_accum)

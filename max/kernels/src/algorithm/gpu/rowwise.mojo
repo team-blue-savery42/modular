@@ -218,6 +218,13 @@ but past ~16 chunks the per-warp serial work — amplified by phases — loses
 badly for multi-phase ops (softmax 4096x8192 1.84x -> 0.71x), so the cap keeps
 longer rows on the block tier."""
 
+comptime _INTEL_WARP_TIER_MIN_ROWS = get_defined_int[
+    "intel_warp_min_rows", 512
+]()
+"""On Intel GPUs, rows with more than 4 warp-tier chunks take the warp tier
+only above this many rows (the crossover on the B70 lies between 512
+and 1,024 rows of 1,024 bf16 values); fewer rows go to the block tier."""
+
 comptime _WARP_SHUFFLE_MAX_WORDS = 4
 """ReduceOp states up to this many `uint32` words use the register-only
 warp-shuffle butterfly inside `generic`; larger states fall back to the shmem
@@ -387,10 +394,20 @@ struct BlockReducer[BLOCK_SIZE: Int](Reducer, TrivialRegisterPassable):
             # Warp 0 combines the per-warp results (lanes beyond
             # `n_warps` get identity); lane 0 broadcasts via shmem[0].
             if w_idx == 0:
-                if l_idx < n_warps:
-                    state = shmem[l_idx]
+                comptime if n_warps <= WARP_SIZE:
+                    if l_idx < n_warps:
+                        state = shmem[l_idx]
+                    else:
+                        state = S()
                 else:
+                    # More warps than lanes (16-lane warps in a block of more
+                    # than 256 threads): each lane joins every `WARP_SIZE`th
+                    # entry, so no warp's result is dropped.
                     state = S()
+                    comptime for j in range(ceildiv(n_warps, WARP_SIZE)):
+                        var idx = j * WARP_SIZE + l_idx
+                        if idx < n_warps:
+                            state.join(shmem[idx])
                 _warp_shuffle_combine(state)
                 if l_idx == 0:
                     shmem[0] = state
@@ -1809,6 +1826,19 @@ def _launch[
     var warp_max = (
         warp_size * effective_simd * _WARP_TIER_CHUNK_CAP
     ) if warp_simd else warp_size * _WARP_TIER_CHUNK_CAP
+    comptime if ctx.default_device_info.api == "level_zero":
+        # Intel (measured on the B70 at 16 lanes, bf16 RMSNorm over
+        # 1,024-wide rows): one warp per row grid-striding 8 chunks is
+        # latency-bound until there are many rows (decode [1, 1024] 6.15 us
+        # against 3.39 on the block tier; [512, 1024] 6.55 against 6.12) and
+        # wins only past them ([1024, 1024] 7.55 against 11.10, [2048, 1024]
+        # 11.59 against 20.39). Up to `_INTEL_WARP_TIER_MIN_ROWS` rows the
+        # warp tier takes at most 4 chunks; 2-chunk rows ([*, 256]) keep it.
+        if num_rows <= _INTEL_WARP_TIER_MIN_ROWS:
+            warp_max = min(
+                warp_max,
+                warp_size * (effective_simd if warp_simd else 1) * 4,
+            )
     if row_size <= warp_max:
         comptime WARP_BLOCK_SIZE = warp_size * WARP_BLOCK_WARPS
         var num_blocks = min(
