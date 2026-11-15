@@ -25,6 +25,7 @@ modular_cc_library(
     srcs = [
         "Abort.cpp",
         "Convergent.cpp",
+        "Heap.cpp",
         "RemapAddressSpaces.cpp",
         "SPIRVBinary.cpp",
         "SubgroupSize.cpp",
@@ -32,6 +33,7 @@ modular_cc_library(
     hdrs = [
         "Abort.h",
         "Convergent.h",
+        "Heap.h",
         "RemapAddressSpaces.h",
         "SPIRVBinary.h",
         "SubgroupSize.h",
@@ -128,6 +130,18 @@ modular_cc_test(
         "@llvm-project//llvm:AsmParser",
         "@llvm-project//llvm:Core",
         "@llvm-project//llvm:Passes",
+        "@llvm-project//llvm:Support",
+    ],
+)
+
+modular_cc_test(
+    name = "HeapTest",
+    size = "small",
+    srcs = ["test/HeapTest.cpp"],
+    deps = [
+        ":IntelPasses",
+        "@llvm-project//llvm:AsmParser",
+        "@llvm-project//llvm:Core",
         "@llvm-project//llvm:Support",
     ],
 )
