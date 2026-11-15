@@ -24,6 +24,7 @@ modular_cc_library(
     name = "IntelPasses",
     srcs = [
         "Abort.cpp",
+        "ConstantMemory.cpp",
         "Convergent.cpp",
         "Heap.cpp",
         "RemapAddressSpaces.cpp",
@@ -32,6 +33,7 @@ modular_cc_library(
     ],
     hdrs = [
         "Abort.h",
+        "ConstantMemory.h",
         "Convergent.h",
         "Heap.h",
         "RemapAddressSpaces.h",
@@ -112,6 +114,18 @@ modular_cc_test(
     name = "AbortTest",
     size = "small",
     srcs = ["test/AbortTest.cpp"],
+    deps = [
+        ":IntelPasses",
+        "@llvm-project//llvm:AsmParser",
+        "@llvm-project//llvm:Core",
+        "@llvm-project//llvm:Support",
+    ],
+)
+
+modular_cc_test(
+    name = "ConstantMemoryTest",
+    size = "small",
+    srcs = ["test/ConstantMemoryTest.cpp"],
     deps = [
         ":IntelPasses",
         "@llvm-project//llvm:AsmParser",
