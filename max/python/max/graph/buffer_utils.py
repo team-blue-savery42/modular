@@ -23,6 +23,7 @@ from max.driver import Buffer, Device, DLPackArray
 from max.dtype import DType
 from max.engine import InferenceSession  # type: ignore
 from max.graph import DeviceRef, Graph, TensorType
+from max.graph._build_config import HAL_DEVICE_CONTEXT
 
 # Per-session, per-(src,dst,device) compiled cast models.
 _CAST_MODELS: dict[tuple[int, str, int, int, int], Model] = {}
@@ -124,6 +125,16 @@ def cast_dlpack_to(
     t = Buffer.from_dlpack(raw_tensor)
     if t.dtype != old_dtype:
         t = t.view(old_dtype, t.shape)
+    if HAL_DEVICE_CONTEXT and t.device.is_host and device.is_host:
+        # Cast a completed copy, not the caller's memory: in the HAL build
+        # (--//:hal_device_context=true; the default build is right and
+        # skips the copy) a CPU graph whose input is a view of a
+        # memory-mapped checkpoint (SafeTensor.get_buffer) can compute from
+        # its output's stale bytes when the file isn't in the page cache, so
+        # Qwen3.5's dt_bias casts gave garbage on a cold start. The copy is
+        # asynchronous on the CPU queue, so it must complete before the cast.
+        t = t.copy()
+        t.device.synchronize()
     t = t.to(device)
     return cast_tensor_to(t, new_dtype, session=session)
 
