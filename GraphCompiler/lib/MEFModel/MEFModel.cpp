@@ -495,7 +495,16 @@ captureStreams(MutableArrayRef<AnyAsyncValueRef> extraArgs) {
            "captureStreams: DeviceContextRef holds a null pointer — "
            "was mapDeviceRefsToDevices called correctly?");
     Driver::Device::API api = context->getPointer()->device().api();
-    if (api != Driver::Device::cudaAPI && api != Driver::Device::hipAPI)
+#if MODULAR_HAL_DEVICE_CONTEXT
+    // The HAL backend captures device graphs only through Intel's Level Zero
+    // plugin; every other HAL device is skipped.
+    bool halPluginGraphs =
+        context->getPointer()->device().apiString() == "level_zero";
+#else
+    bool halPluginGraphs = false;
+#endif
+    if (api != Driver::Device::cudaAPI && api != Driver::Device::hipAPI &&
+        !halPluginGraphs)
       continue;
 
     ErrorOr<Driver::DeviceStreamRef> streamOr = context->getPointer()->stream();

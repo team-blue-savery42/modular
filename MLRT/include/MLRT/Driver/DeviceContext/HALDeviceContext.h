@@ -149,6 +149,8 @@ public:
   /// without a dedicated constant (for example the mock test plugin) report
   /// the generic `gpuAPI`.
   API api() const { return api_; }
+  /// The plugin API string the device was created with (e.g. "level_zero").
+  const std::string &apiString() const { return apiStr_; }
   int id() const { return id_; }
   /// Whether this is a virtual (compile-only) device.
   bool isVirtual() const { return compilationDevice_ != nullptr; }
@@ -458,6 +460,7 @@ public:
 
 private:
   friend class DeviceContext;
+  friend class DeviceGraph;
   DeviceStream(MojoHALStreamBox *mojoStream, DeviceRef device)
       : mojoStream_(mojoStream), device_(std::move(device)) {}
 
@@ -499,11 +502,11 @@ private:
 
 /// A collection of device graphs generated during a recording session.
 ///
-/// Device graphs are not supported by the HAL backend: `DeviceGraph::capture`
-/// fails with an error and no `DeviceGraph` instance is ever created, so the
-/// replay entry points below are never reached at runtime. The class exists so
-/// graph-aware consumers (MEFModel) compile unchanged; their capture attempts
-/// surface the unsupported-feature error.
+/// The HAL backend captures device graphs only through a plugin that exports
+/// the Intel graph entry points (the Level Zero plugin's
+/// `M_driver_intel_graph_*`, outside the HAL C API). For every other plugin
+/// `DeviceGraph::capture` fails with the unsupported-feature error and no
+/// `DeviceGraph` instance is created.
 class MODULAR_CXX_EXPORT DeviceGraphCollection {
 public:
   explicit DeviceGraphCollection(
@@ -540,10 +543,19 @@ private:
 };
 
 /// A captured sequence of GPU operations that can be replayed. See the
-/// DeviceGraphCollection note: the HAL backend never creates instances.
+/// DeviceGraphCollection note: only a plugin with graph entry points makes
+/// instances.
 class MODULAR_CXX_EXPORT DeviceGraph final
     : public ReferenceCounted<DeviceGraph> {
 public:
+  /// A plugin graph recorded on `stream`'s queue; destroyed with the graph.
+  DeviceGraph(DeviceStreamRef stream, void *pluginGraph,
+              int64_t (*destroy)(void *), int64_t (*launch)(void *, void *),
+              void *pluginQueue)
+      : stream_(std::move(stream)), pluginGraph_(pluginGraph),
+        destroy_(destroy), launch_(launch), pluginQueue_(pluginQueue) {}
+  ~DeviceGraph();
+
   /// Capture a graph by executing a callback. Always fails on the HAL
   /// backend.
   static ErrorOr<DeviceGraphCollection>
@@ -606,6 +618,11 @@ private:
   llvm::SmallVector<DeviceBufferRef> inputs_;
   llvm::SmallVector<AsyncRT::AnyAsyncValueRef> outputs_;
   llvm::SmallVector<StableAssignment> stableAssignments_;
+  DeviceStreamRef stream_;
+  void *pluginGraph_ = nullptr;
+  int64_t (*destroy_)(void *) = nullptr;
+  int64_t (*launch_)(void *, void *) = nullptr;
+  void *pluginQueue_ = nullptr;
 };
 
 /// A single stream of execution on one device, backed by a heap-boxed Mojo
