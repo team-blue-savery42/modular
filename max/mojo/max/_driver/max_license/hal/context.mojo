@@ -559,6 +559,16 @@ struct Context[device_spec: DeviceSpec](Deinitable, Movable):
         cap) on a loaded function."""
         self._raw[].set_function_attribute(self._handle, func, attribute, value)
 
+    def get_optional_function_property(
+        self, func: FunctionHandle, var name: String
+    ) raises HALError -> OptionalReg[UInt64]:
+        """Queries a named uint64 property of a loaded function; None when the
+        plugin does not expose `name`. Every function property is a uint64
+        (see `RawDriver.get_optional_function_property`)."""
+        return self._raw[].get_optional_function_property(
+            self._handle, func, name
+        )
+
     def _function_cache_lock_acquire(self):
         var expected = Int64(0)
         var waiter = SpinWaiter()

@@ -906,6 +906,40 @@ struct RawDriver(Movable):
             )
         return num_blocks.unsafe_assume_init()
 
+    def get_optional_function_property(
+        self,
+        context: ContextHandle,
+        function: FunctionHandle,
+        mut name: String,
+    ) raises HALError -> OptionalReg[UInt64]:
+        """Queries a named uint64 property of a loaded function, returning
+        None if the plugin does not expose it (`UNKNOWN_PROPERTY_NAME`). Any
+        other failure raises.
+
+        Every function property the plugins define is a uint64
+        (`native_handle`, `global_address:NAME`, `global_size:NAME`), and the
+        ABI's `void *value` carries no size, so a plugin writes 8 bytes. The
+        out-buffer is therefore always a UInt64, never a caller-chosen type
+        that could be smaller."""
+        var value = MaybeUninit[UInt64]()
+        var status = self._raw.base.function_property.get()(
+            context,
+            function,
+            name.as_c_string_span(),
+            OutParam[UInt64](to=value).unsafe_bitcast[NoneType](),
+        )
+        if status == STATUS_UNKNOWN_PROPERTY_NAME:
+            return OptionalReg[UInt64]()
+        if status != STATUS_SUCCESS:
+            var err = self.get_status_message(status)
+            raise HALError(
+                err.status,
+                message=String(
+                    t"failed to get function property '{name}': {err.message}"
+                ),
+            )
+        return OptionalReg[UInt64](value.unsafe_assume_init())
+
     def tensor_map_encode_tiled(
         self,
         context: ContextHandle,
