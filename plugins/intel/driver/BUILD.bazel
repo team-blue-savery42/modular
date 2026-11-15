@@ -15,6 +15,7 @@ modular_cc_binary(
         "DeviceFeatures.cpp",
         "Driver.cpp",
         "IntelDeviceFeatures.h",
+        "IntelGraphs.h",
         "Limits.cpp",
         "Module.cpp",
         "Plugin.h",
@@ -78,11 +79,13 @@ modular_cc_test(
     size = "small",
     srcs = [
         "IntelDeviceFeatures.h",
+        "IntelGraphs.h",
         "Plugin.h",
         "Profile.h",
         "ZeApi.h",
         "test/LevelZeroAttributeTest.cpp",
         "test/LevelZeroDeviceFeaturesTest.cpp",
+        "test/LevelZeroGraphTest.cpp",
         "test/LevelZeroLaunchTest.cpp",
         "test/LevelZeroPluginTest.cpp",
     ],
@@ -121,7 +124,10 @@ modular_cc_test(
 modular_cc_test(
     name = "LevelZeroProfileTest",
     size = "small",
-    srcs = ["test/LevelZeroProfileTest.cpp"],
+    srcs = [
+        "IntelGraphs.h",
+        "test/LevelZeroProfileTest.cpp",
+    ],
     data = [
         "test/data/vector_add.spv",
         ":LevelZeroPlugin.so",

@@ -117,6 +117,19 @@ struct M_driver_context {
   std::vector<M_driver_queue *> queues;
   /// Notified when a free stops draining queues (`M_driver_queue::drainers`).
   std::condition_variable queuesIdle;
+  /// Graph capture (IntelGraphs.h): how many of the context's queues
+  /// capture, how many graphs are alive, and the graph pool: memory freed
+  /// while a queue captures, and memory allocated during a capture and
+  /// freed while a graph lives, by capacity. A graph's launches reuse the
+  /// addresses its capture saw, so that memory is never released while a
+  /// graph lives; later captures allocate from the pool (graphs launch in
+  /// queue order, so their scratch can be shared, as CUDA's graph memory
+  /// pool does), and the pool is released with the last graph.
+  /// Guarded by `captureMutex`.
+  std::mutex captureMutex;
+  int capturing = 0;
+  int liveGraphs = 0;
+  std::multimap<uint64_t, M_driver_memory *> graphPool;
 };
 
 struct M_driver_memory;
@@ -170,6 +183,10 @@ struct M_driver_queue {
   /// Launch profiling (MOJO_INTEL_PROFILE, Profile.h); null when off.
   /// Guarded by `mutex`.
   std::unique_ptr<M::Intel::Profiling::QueueProfile> profile;
+  /// Whether the list records into a graph (IntelGraphs.h): appends are
+  /// captured, not run, so no free mark, sync barrier or profile event goes
+  /// on it. Guarded by `mutex`.
+  bool capturing = false;
   /// Synchronous frees appending to this queue; `queue_destroy` waits for
   /// none.
   /// Guarded by the context's `queuesMutex`.
@@ -257,6 +274,11 @@ struct M_driver_memory {
   /// fills must wait for them first. Null once they are known done.
   M_driver_queue *reuseQueue = nullptr;
   uint64_t reuseAfter = 0;
+  /// Allocated while a queue of the context captured: a graph's launches
+  /// may use it again even when it is freed after the capture (a graph's
+  /// outputs are), so while a graph lives its free puts it in the graph
+  /// pool.
+  bool graphOwned = false;
 };
 
 namespace M::Intel {
