@@ -22,6 +22,7 @@
 #include "IntelBackend.h"
 
 #include "Abort.h"
+#include "AggregatePhis.h"
 #include "ConstantMemory.h"
 #include "Convergent.h"
 #include "DynamicSharedMemory.h"
@@ -222,6 +223,9 @@ protected:
     // wrongly, so none may reach it.
     if (llvm::Expected<bool> lowered = lowerInt128(module); !lowered)
       return lowered.takeError();
+    // After every pass that adds phis (returnAfterAbort): IGC loses values
+    // merged by aggregate phis.
+    splitAggregatePhis(module);
     return addDynamicSharedMemoryParameter(module);
   }
 

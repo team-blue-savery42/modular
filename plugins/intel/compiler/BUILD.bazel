@@ -24,6 +24,7 @@ modular_cc_library(
     name = "IntelPasses",
     srcs = [
         "Abort.cpp",
+        "AggregatePhis.cpp",
         "ConstantMemory.cpp",
         "Convergent.cpp",
         "DynamicSharedMemory.cpp",
@@ -40,6 +41,7 @@ modular_cc_library(
     ],
     hdrs = [
         "Abort.h",
+        "AggregatePhis.h",
         "ConstantMemory.h",
         "Convergent.h",
         "DynamicSharedMemory.h",
@@ -265,6 +267,18 @@ modular_cc_test(
         "@llvm-project//llvm:Support",
         "@llvm-project//llvm:Target",
         "@llvm-project//llvm:TargetParser",
+    ],
+)
+
+modular_cc_test(
+    name = "AggregatePhisTest",
+    size = "small",
+    srcs = ["test/AggregatePhisTest.cpp"],
+    deps = [
+        ":IntelPasses",
+        "@llvm-project//llvm:AsmParser",
+        "@llvm-project//llvm:Core",
+        "@llvm-project//llvm:Support",
     ],
 )
 
