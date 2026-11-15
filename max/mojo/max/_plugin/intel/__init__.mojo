@@ -40,6 +40,9 @@ from max.gpu.sync.sync import (
 
 from .._shuffle import shuffle_words
 from .._trait import MaxPlugin, MaxPluginHooks
+from max._driver.max_license.hal._plugin.intel.intel_plugin import (
+    IntelHalPluginHooks,
+)
 
 # OpenCL `cl_mem_fence_flags`.
 comptime _CLK_LOCAL_MEM_FENCE = UInt32(1)
@@ -106,6 +109,7 @@ struct IntelMaxPluginHooks[target: CompilationTarget](MaxPluginHooks):
     comptime warp_size = 32 if Self.target._has_feature[
         "sub-group-size-32"
     ]() else 16
+    comptime HalHooks = IntelHalPluginHooks[Self.target]
     comptime barrier_fn: OptionalReg[_BarrierPluginHookFnType] = _barrier
     comptime syncwarp_fn: OptionalReg[_SyncwarpPluginHookFnType] = _syncwarp
 
