@@ -99,6 +99,9 @@ def _resolve_max_threads_per_block_metadata() -> __mlir_type.`!kgen.string`:
     elif is_apple_gpu():
         # That attribute is used to represent Metal's [[max_total_threads_per_threadgroup(x)]]
         return "pop.air.max_work_group_size".value
+    elif current_accelerator()._is_triple_arch["spirv64"]():
+        # Intel GPUs; the Intel compiler plugin's lowering reads it.
+        return "pop.intel.max_work_group_size".value
     else:
         CompilationTarget.unsupported_target_error[
             operation="MAX_THREADS_PER_BLOCK_METADATA",
