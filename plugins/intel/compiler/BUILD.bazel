@@ -23,12 +23,14 @@ modular_cc_library(
 modular_cc_library(
     name = "IntelPasses",
     srcs = [
+        "Abort.cpp",
         "Convergent.cpp",
         "RemapAddressSpaces.cpp",
         "SPIRVBinary.cpp",
         "SubgroupSize.cpp",
     ],
     hdrs = [
+        "Abort.h",
         "Convergent.h",
         "RemapAddressSpaces.h",
         "SPIRVBinary.h",
@@ -101,6 +103,18 @@ modular_cc_test(
         "@llvm-project//llvm:Support",
         "@llvm-project//llvm:Target",
         "@llvm-project//llvm:TargetParser",
+    ],
+)
+
+modular_cc_test(
+    name = "AbortTest",
+    size = "small",
+    srcs = ["test/AbortTest.cpp"],
+    deps = [
+        ":IntelPasses",
+        "@llvm-project//llvm:AsmParser",
+        "@llvm-project//llvm:Core",
+        "@llvm-project//llvm:Support",
     ],
 )
 
