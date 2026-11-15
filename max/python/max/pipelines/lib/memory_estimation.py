@@ -209,6 +209,9 @@ class MemoryEstimator:
             activation_size = planner.estimate_activation_memory(
                 pipeline_config, model_config.huggingface_config
             )
+            activation_size += _level_zero_prompt_activation_bytes(
+                pipeline_config, model_config, devices, max_batch_size
+            )
             signal_buffer_size = planner.estimate_signal_buffer_memory(
                 pipeline_config, arch_config
             )
@@ -1240,3 +1243,54 @@ class MemoryEstimator:
             # batching on CPU is generally not useful, so we hard-code a batch size of 1.
             return 1
         return _DEFAULT_BATCH_SIZE
+
+
+def _level_zero_prompt_activation_bytes(
+    pipeline_config: PipelineConfig,
+    model_config: MAXModelConfig,
+    devices: list[Device],
+    max_batch_size: int | None,
+) -> int:
+    """Activation memory a full prompt batch needs on Intel (Level Zero) GPUs.
+
+    Text architectures whose planner reserves nothing for activations leave
+    them the 1 - `device_memory_utilization` share of free memory. On the
+    32 GB Intel Arc Pro B70 that share was 1.4 GiB for Qwen3-8B, and a
+    4-request prompt batch (2,048 tokens) needs more than that for each
+    layer's working set, so serving failed from 4 concurrent requests. This
+    reserves the widest layer's float32 working set for `max_batch_input_tokens`
+    tokens, plus the float32 logits of the requests in a batch: the models
+    gather the last prompt token of each request before the LM
+    head, so the logits are `max_batch_size` rows, not one per prompt token.
+    Hybrid models with Gated DeltaNet layers add those layers' working set.
+    It is 0 for every other device API.
+    """
+    if not any(device.api == "level_zero" for device in devices):
+        return 0
+    hf = model_config.huggingface_config
+    hf = getattr(hf, "text_config", hf)
+    vocab = getattr(hf, "vocab_size", None)
+    hidden = getattr(hf, "hidden_size", None)
+    if not vocab or not hidden:
+        return 0
+    inter = getattr(hf, "intermediate_size", None) or 4 * hidden
+    tokens = pipeline_config.runtime.max_batch_input_tokens
+    logit_rows = min(max_batch_size or tokens, tokens)
+    # Logits in float32 (with a copy for sampling), plus one layer's widest
+    # float32 working set (gate and up projections, residual and normalized
+    # hidden states) for every token of the batch.
+    per_token = (2 * inter + 4 * hidden) * 4
+    # Gated DeltaNet layers (Qwen3.5) keep the QKV projection and its float32
+    # convolution output, the float32 recurrence output and the recurrence's
+    # per-chunk state checkpoints: a 32,768-token prompt step of Qwen3.5-0.8B
+    # (conv_dim 6144, value_dim 2048) used 5.5 GB, 168 KB per token; 20 bytes
+    # per channel on top of the dense layer's share covers that.
+    nv = getattr(hf, "linear_num_value_heads", None)
+    nk = getattr(hf, "linear_num_key_heads", None)
+    dv = getattr(hf, "linear_value_head_dim", None)
+    dk = getattr(hf, "linear_key_head_dim", None)
+    if nv and nk and dv and dk:
+        value_dim = nv * dv
+        conv_dim = 2 * nk * dk + value_dim
+        per_token += (conv_dim + value_dim) * 20
+    return int(logit_rows * vocab * 4 * 2 + tokens * per_token)
