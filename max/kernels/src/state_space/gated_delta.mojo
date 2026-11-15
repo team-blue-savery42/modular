@@ -99,6 +99,7 @@ Outputs:
 """
 
 import std.math
+from std.sys.defines import get_defined_int
 from max.gpu import (
     WARP_SIZE,
     block_idx,
@@ -434,6 +435,488 @@ def gated_delta_recurrence_fwd_gpu[
         )
 
     pdl_exit()
+
+
+# ===----------------------------------------------------------------------=== #
+# Intel: sub-groups over the key rows of a few state columns
+# ===----------------------------------------------------------------------=== #
+
+
+comptime GATED_DELTA_INTEL_COLUMNS_PER_SUB_GROUP = get_defined_int[
+    "gated_delta_intel_cols", 2
+]()
+"""State columns each sub-group of the Intel recurrence owns."""
+
+comptime GATED_DELTA_INTEL_SUB_GROUPS = get_defined_int[
+    "gated_delta_intel_sgs", 16
+]()
+"""Sub-groups per work-group in the Intel recurrence."""
+
+comptime GATED_DELTA_INTEL_COLUMNS = (
+    GATED_DELTA_INTEL_COLUMNS_PER_SUB_GROUP * GATED_DELTA_INTEL_SUB_GROUPS
+)
+"""State columns per work-group in the Intel recurrence."""
+
+
+@always_inline
+def gated_delta_recurrence_fwd_intel_gpu[
+    work_dtype: DType,
+    state_dtype: DType,
+    KEY_HEAD_DIM: Int,
+    VALUE_HEAD_DIM: Int,
+    recurrence_output_LT: TensorLayout,
+    qkv_conv_output_LT: TensorLayout,
+    decay_per_token_LT: TensorLayout,
+    beta_per_token_LT: TensorLayout,
+    recurrent_state_LT: TensorLayout,
+    slot_idx_LT: TensorLayout,
+    input_row_offsets_LT: TensorLayout,
+    Engine: TensorEngine,
+](
+    batch_size: Int32,
+    num_value_heads: Int32,
+    num_key_heads: Int32,
+    key_dim: Int32,
+    recurrence_output: TileTensor[
+        work_dtype, recurrence_output_LT, MutUntrackedOrigin, Engine=Engine
+    ],
+    recurrent_state: TileTensor[
+        state_dtype, recurrent_state_LT, MutUntrackedOrigin, Engine=Engine
+    ],
+    slot_idx: TileTensor[
+        .uint32, slot_idx_LT, ImmUntrackedOrigin, Engine=Engine
+    ],
+    qkv_conv_output: TileTensor[
+        work_dtype, qkv_conv_output_LT, ImmUntrackedOrigin, Engine=Engine
+    ],
+    decay_per_token: TileTensor[
+        work_dtype, decay_per_token_LT, ImmUntrackedOrigin, Engine=Engine
+    ],
+    beta_per_token: TileTensor[
+        work_dtype, beta_per_token_LT, ImmUntrackedOrigin, Engine=Engine
+    ],
+    input_row_offsets: TileTensor[
+        .uint32, input_row_offsets_LT, ImmUntrackedOrigin, Engine=Engine
+    ],
+):
+    """The gated delta recurrence for Intel GPUs (measured on the B70).
+
+    `gated_delta_recurrence_fwd_gpu` keeps a whole `KEY_HEAD_DIM`-element
+    state column per thread, one work-group per value head: at Intel's 16
+    lanes that is the whole register file per thread, and Qwen3.5's 16
+    heads leave half of the B70's Xe-cores idle. Here a sub-group owns
+    `GATED_DELTA_INTEL_COLUMNS_PER_SUB_GROUP` columns, lane `l` holding rows
+    `l * KEY_HEAD_DIM / WARP_SIZE` on of each (one vector read of q and of k
+    per token), and a work-group `GATED_DELTA_INTEL_SUB_GROUPS` sub-groups of
+    one head. Per token the two reductions over the key rows are sub-group
+    sums of all the sub-group's columns at once.
+
+    The loop is bound by instructions issued per token, not by memory. To
+    keep them few, the work-group stages `WARP_SIZE` tokens at a time in
+    shared memory (q, k, its values, the decay and the beta), normalizes q
+    and k there once (L2 with eps 1e-6 under the root, q also by
+    1/sqrt(KD)), and each sub-group then runs the delta rule on unit
+    vectors: state *= decay; delta = beta * (v - state . k); state +=
+    k * delta; out = state . q, both dot products taken from the state before
+    the token (see the loop). That is `_gated_delta_token_step`'s formula with
+    its norms folded into q and k (rounded differently, not bit-equal).
+    Each lane keeps one token's readouts and stores them once per chunk.
+
+      Grid  : (batch_size * num_value_heads * VALUE_HEAD_DIM / COLUMNS,)
+      Block : (GATED_DELTA_INTEL_SUB_GROUPS * WARP_SIZE,)
+    """
+    comptime C = GATED_DELTA_INTEL_COLUMNS_PER_SUB_GROUP
+    comptime SGS = GATED_DELTA_INTEL_SUB_GROUPS
+    comptime COLUMNS = GATED_DELTA_INTEL_COLUMNS
+    comptime assert KEY_HEAD_DIM % WARP_SIZE == 0
+    comptime assert VALUE_HEAD_DIM % COLUMNS == 0
+    comptime ROWS = KEY_HEAD_DIM // WARP_SIZE
+    comptime GROUPS = VALUE_HEAD_DIM // COLUMNS
+    comptime CHUNK = WARP_SIZE
+    comptime ROW = 2 * KEY_HEAD_DIM + COLUMNS + 3
+    comptime THREADS = SGS * WARP_SIZE
+    var nv = Int(num_value_heads)
+    var lane = Int(lane_id())
+    var sg = Int(warp_id())
+    var tid = Int(thread_idx.x)
+    var head_group, group = divmod(Int(block_idx.x), GROUPS)
+    var batch_item_idx, value_head_idx = divmod(head_group, nv)
+    if batch_item_idx >= Int(batch_size):
+        return
+    var first_column = group * COLUMNS + sg * C
+    var key_head_idx = value_head_idx // (nv // Int(num_key_heads))
+    var slot = Int(slot_idx[batch_item_idx])
+
+    # state[c * ROWS + r] = pool[slot, head, lane * ROWS + r, column c].
+    var state = SIMD[DType.float32, ROWS * C](0.0)
+    comptime for c in range(C):
+        comptime for r in range(ROWS):
+            state[c * ROWS + r] = Float32(
+                recurrent_state.load[width=1](
+                    (slot, value_head_idx, lane * ROWS + r, first_column + c)
+                )
+            )
+
+    var staged = unsafe_stack_allocation[
+        CHUNK * ROW, Float32, address_space=.SHARED
+    ]()
+    var start = Int(input_row_offsets[batch_item_idx])
+    var end = Int(input_row_offsets[batch_item_idx + 1])
+    var query_head_base = key_head_idx * KEY_HEAD_DIM
+    var key_head_base = Int(key_dim) + query_head_base
+    var value_base = (
+        2 * Int(key_dim) + value_head_idx * VALUE_HEAD_DIM + (group * COLUMNS)
+    )
+    var query_scale = Float32(1.0) / std.math.sqrt(Float32(KEY_HEAD_DIM))
+    var chunk_start = start
+    # The chunk staged in shared memory, whose tokens are run next.
+    var staged_start = start
+    var staged_count = 0
+    comptime assert THREADS % WARP_SIZE == 0
+    comptime QK_LOADS = ceildiv(CHUNK * 2 * KEY_HEAD_DIM, THREADS)
+    comptime V_LOADS = ceildiv(CHUNK * COLUMNS, THREADS)
+    # Each pass issues the global loads of the next chunk, runs the tokens
+    # of the staged one while they are in flight, and only then stages the
+    # new chunk: the loads' latency overlaps the recurrence instead of
+    # stalling each chunk (measured on the B70).
+    while True:
+        var count = min(CHUNK, end - chunk_start)
+        var qk = SIMD[DType.float32, QK_LOADS](0.0)
+        var vs = SIMD[DType.float32, V_LOADS](0.0)
+        var gate = Float32(0.0)
+        var gate_tok, gate_kind = divmod(tid, 2)
+        if count > 0:
+            # All of a thread's loads are issued before any is stored: a loop
+            # that stores each as it arrives waits out a load latency per
+            # element.
+            # Rows past the sequence repeat its last token (never read).
+            comptime for j in range(QK_LOADS):
+                var e = j * THREADS + tid
+                var tok, f = divmod(e, 2 * KEY_HEAD_DIM)
+                var t = chunk_start + min(tok, count - 1)
+                var channel = (
+                    query_head_base + f if f
+                    < KEY_HEAD_DIM else key_head_base + f - KEY_HEAD_DIM
+                )
+                if e < CHUNK * 2 * KEY_HEAD_DIM:
+                    qk[j] = Float32(qkv_conv_output.load[width=1]((t, channel)))
+            comptime for j in range(V_LOADS):
+                var e = j * THREADS + tid
+                var tok, f = divmod(e, COLUMNS)
+                var t = chunk_start + min(tok, count - 1)
+                if e < CHUNK * COLUMNS:
+                    vs[j] = Float32(
+                        qkv_conv_output.load[width=1]((t, value_base + f))
+                    )
+            var gate_t = chunk_start + min(gate_tok, count - 1)
+            if tid < 2 * CHUNK:
+                if gate_kind == 0:
+                    gate = Float32(
+                        decay_per_token.load[width=1]((gate_t, value_head_idx))
+                    )
+                else:
+                    gate = Float32(
+                        beta_per_token.load[width=1]((gate_t, value_head_idx))
+                    )
+        if staged_count > 0:
+            var my_out = SIMD[DType.float32, C](0.0)
+            for tok in range(staged_count):
+                var row = staged + tok * ROW
+                var q = SIMD[DType.float32, ROWS](0.0)
+                var k = SIMD[DType.float32, ROWS](0.0)
+                q = (row + lane * ROWS).unsafe_load[width=ROWS]()
+                k = (row + KEY_HEAD_DIM + lane * ROWS).unsafe_load[width=ROWS]()
+                var values = SIMD[DType.float32, C](0.0)
+                comptime for c in range(C):
+                    values[c] = row[2 * KEY_HEAD_DIM + sg * C + c]
+                var decay_value = row[2 * KEY_HEAD_DIM + COLUMNS]
+                var beta_value = row[2 * KEY_HEAD_DIM + COLUMNS + 1]
+
+                var qk = row[2 * KEY_HEAD_DIM + COLUMNS + 2]
+                # From the state before this token, with s' = d s + k delta:
+                #   s' . k = d (s . k), and s' . q = d (s . q) + delta (q . k),
+                # so both dot products are one reduction of the old state, and
+                # the update is off the token's dependency chain.
+                var dots = SIMD[DType.float32, 2 * C](0.0)
+                comptime for c in range(C):
+                    var col = state.slice[ROWS, offset=c * ROWS]()
+                    dots[c] = (col * k).reduce_add()
+                    dots[C + c] = (col * q).reduce_add()
+                dots = warp.lane_group_sum[num_lanes=WARP_SIZE](dots)
+                var kv = decay_value * dots.slice[C, offset=0]()
+                var delta = beta_value * (values - kv)
+                var readout = fma(
+                    SIMD[DType.float32, C](decay_value),
+                    dots.slice[C, offset=C](),
+                    delta * qk,
+                )
+                comptime for c in range(C):
+                    comptime for r in range(ROWS):
+                        state[c * ROWS + r] = fma(
+                            k[r], delta[c], state[c * ROWS + r] * decay_value
+                        )
+                # Lane `tok` keeps token `tok`'s readouts.
+                my_out = readout if lane == tok else my_out
+            if lane < staged_count:
+                comptime for c in range(C):
+                    recurrence_output.store(
+                        (
+                            staged_start + lane,
+                            value_head_idx * VALUE_HEAD_DIM + first_column + c,
+                        ),
+                        Scalar[work_dtype](my_out[c]),
+                    )
+        if count <= 0:
+            break
+        barrier()
+        comptime for j in range(QK_LOADS):
+            var e = j * THREADS + tid
+            var tok, f = divmod(e, 2 * KEY_HEAD_DIM)
+            if e < CHUNK * 2 * KEY_HEAD_DIM:
+                staged[tok * ROW + f] = qk[j]
+        comptime for j in range(V_LOADS):
+            var e = j * THREADS + tid
+            var tok, f = divmod(e, COLUMNS)
+            if e < CHUNK * COLUMNS:
+                staged[tok * ROW + 2 * KEY_HEAD_DIM + f] = vs[j]
+        if tid < 2 * CHUNK:
+            staged[
+                gate_tok * ROW + 2 * KEY_HEAD_DIM + COLUMNS + gate_kind
+            ] = gate
+        barrier()
+        # Normalize each token's q and k in place, one sub-group per token.
+        var tok_n = sg
+        while tok_n < count:
+            var row = staged + tok_n * ROW
+            var q = SIMD[DType.float32, ROWS](0.0)
+            var k = SIMD[DType.float32, ROWS](0.0)
+            q = (row + lane * ROWS).unsafe_load[width=ROWS]()
+            k = (row + KEY_HEAD_DIM + lane * ROWS).unsafe_load[width=ROWS]()
+            var squares = warp.lane_group_sum[num_lanes=WARP_SIZE](
+                SIMD[DType.float32, 2](
+                    (q * q).reduce_add(), (k * k).reduce_add()
+                )
+            )
+            var qf = rsqrt(squares[0] + Float32(1e-6)) * query_scale
+            var kf = rsqrt(squares[1] + Float32(1e-6))
+            (row + lane * ROWS).unsafe_store(0, q * qf)
+            (row + KEY_HEAD_DIM + lane * ROWS).unsafe_store(0, k * kf)
+            # q . k of the unit vectors, for the readout below.
+            var qk = warp.lane_group_sum[num_lanes=WARP_SIZE](
+                (q * k).reduce_add()
+            )
+            if lane == 0:
+                row[2 * KEY_HEAD_DIM + COLUMNS + 2] = qk * qf * kf
+            tok_n += SGS
+        barrier()
+
+        staged_start = chunk_start
+        staged_count = count
+        chunk_start += CHUNK
+
+    comptime for c in range(C):
+        comptime for r in range(ROWS):
+            recurrent_state.store(
+                (slot, value_head_idx, lane * ROWS + r, first_column + c),
+                Scalar[state_dtype](state[c * ROWS + r]),
+            )
+
+
+comptime GATED_DELTA_INTEL_DECODE_SUB_GROUPS = 16
+"""Sub-groups per work-group in the Intel decode recurrence (each owns
+`KEY_HEAD_DIM / 16` key rows)."""
+
+comptime GATED_DELTA_INTEL_DECODE_COLUMNS = 2 * WARP_SIZE
+"""State columns per work-group in the Intel decode recurrence (two per
+lane)."""
+
+
+@always_inline
+def gated_delta_recurrence_decode_intel_gpu[
+    work_dtype: DType,
+    state_dtype: DType,
+    KEY_HEAD_DIM: Int,
+    VALUE_HEAD_DIM: Int,
+    recurrence_output_LT: TensorLayout,
+    qkv_conv_output_LT: TensorLayout,
+    decay_per_token_LT: TensorLayout,
+    beta_per_token_LT: TensorLayout,
+    recurrent_state_LT: TensorLayout,
+    slot_idx_LT: TensorLayout,
+    input_row_offsets_LT: TensorLayout,
+    Engine: TensorEngine,
+](
+    batch_size: Int32,
+    num_value_heads: Int32,
+    num_key_heads: Int32,
+    key_dim: Int32,
+    recurrence_output: TileTensor[
+        work_dtype, recurrence_output_LT, MutUntrackedOrigin, Engine=Engine
+    ],
+    recurrent_state: TileTensor[
+        state_dtype, recurrent_state_LT, MutUntrackedOrigin, Engine=Engine
+    ],
+    slot_idx: TileTensor[
+        .uint32, slot_idx_LT, ImmUntrackedOrigin, Engine=Engine
+    ],
+    qkv_conv_output: TileTensor[
+        work_dtype, qkv_conv_output_LT, ImmUntrackedOrigin, Engine=Engine
+    ],
+    decay_per_token: TileTensor[
+        work_dtype, decay_per_token_LT, ImmUntrackedOrigin, Engine=Engine
+    ],
+    beta_per_token: TileTensor[
+        work_dtype, beta_per_token_LT, ImmUntrackedOrigin, Engine=Engine
+    ],
+    input_row_offsets: TileTensor[
+        .uint32, input_row_offsets_LT, ImmUntrackedOrigin, Engine=Engine
+    ],
+):
+    """The gated delta recurrence at decode for Intel GPUs.
+
+    At one token per sequence the work is reading and writing the state once:
+    `gated_delta_recurrence_fwd_gpu` does it with one work-group per head and
+    a whole state column per thread (11-12 us per layer on the B70, a 128-step
+    dependent chain per thread), and the prefill kernel above with strided
+    column reads. Here a work-group owns `GATED_DELTA_INTEL_DECODE_COLUMNS`
+    columns of one head: lane `l` the columns `2l` and `2l + 1` (contiguous
+    loads across the sub-group), sub-group `s` the key rows
+    `s * ROWS ..< (s + 1) * ROWS`. Per token, from the state before it (as
+    in the prefill kernel), with q and k unnormalized:
+      A = s . k and B = s . q per column (partial sums over the rows, then
+      summed over the sub-groups through shared memory);
+      delta = beta * (v - decay * A / |k|);
+      out = (decay * B + delta * (q . k) / |k|) / (|q| sqrt(KD));
+      s' = decay * s + k * (delta / |k|).
+    Each sub-group computes the norms and q . k itself from the token's q and
+    k (no barrier), and every sub-group sums the partials it needs.
+
+      Grid  : (batch_size * num_value_heads * VALUE_HEAD_DIM / COLUMNS,)
+      Block : (GATED_DELTA_INTEL_DECODE_SUB_GROUPS * WARP_SIZE,)
+    """
+    comptime C = 2
+    comptime SGS = GATED_DELTA_INTEL_DECODE_SUB_GROUPS
+    comptime COLUMNS = GATED_DELTA_INTEL_DECODE_COLUMNS
+    comptime assert COLUMNS == C * WARP_SIZE
+    comptime assert KEY_HEAD_DIM % SGS == 0
+    comptime assert KEY_HEAD_DIM % WARP_SIZE == 0
+    comptime assert VALUE_HEAD_DIM % COLUMNS == 0
+    comptime ROWS = KEY_HEAD_DIM // SGS
+    comptime QR = KEY_HEAD_DIM // WARP_SIZE
+    comptime GROUPS = VALUE_HEAD_DIM // COLUMNS
+    var nv = Int(num_value_heads)
+    var lane = Int(lane_id())
+    var sg = Int(warp_id())
+    var head_group, group = divmod(Int(block_idx.x), GROUPS)
+    var batch_item_idx, value_head_idx = divmod(head_group, nv)
+    if batch_item_idx >= Int(batch_size):
+        return
+    var key_head_idx = value_head_idx // (nv // Int(num_key_heads))
+    var slot = Int(slot_idx[batch_item_idx])
+    var column = group * COLUMNS + lane * C
+    var first_row = sg * ROWS
+    var query_base = key_head_idx * KEY_HEAD_DIM
+    var key_base = Int(key_dim) + query_base
+    var value_base = 2 * Int(key_dim) + value_head_idx * VALUE_HEAD_DIM
+    var query_scale = Float32(1.0) / std.math.sqrt(Float32(KEY_HEAD_DIM))
+
+    # state[r * C + c] = pool[slot, head, first_row + r, column + c].
+    var state = SIMD[DType.float32, ROWS * C](0.0)
+    comptime for r in range(ROWS):
+        var pair = recurrent_state.load[width=C](
+            (slot, value_head_idx, first_row + r, column)
+        )
+        comptime for c in range(C):
+            state[r * C + c] = Float32(pair[c])
+
+    # A, B partials of every sub-group, per lane: [sg][lane][4].
+    var partial = unsafe_stack_allocation[
+        SGS * WARP_SIZE * 2 * C, Float32, address_space=.SHARED
+    ]()
+    var start = Int(input_row_offsets[batch_item_idx])
+    var end = Int(input_row_offsets[batch_item_idx + 1])
+    for t in range(start, end):
+        # This thread's key rows of q and k (the same for the whole
+        # sub-group), and a slice of each per lane for the norms.
+        var q_rows = SIMD[DType.float32, ROWS](0.0)
+        var k_rows = SIMD[DType.float32, ROWS](0.0)
+        comptime for r in range(ROWS):
+            q_rows[r] = Float32(
+                qkv_conv_output.load[width=1]((t, query_base + first_row + r))
+            )
+            k_rows[r] = Float32(
+                qkv_conv_output.load[width=1]((t, key_base + first_row + r))
+            )
+        var q = SIMD[DType.float32, QR](0.0)
+        var k = SIMD[DType.float32, QR](0.0)
+        comptime for i in range(QR):
+            q[i] = Float32(
+                qkv_conv_output.load[width=1]((t, query_base + lane * QR + i))
+            )
+            k[i] = Float32(
+                qkv_conv_output.load[width=1]((t, key_base + lane * QR + i))
+            )
+        var values = SIMD[DType.float32, C](0.0)
+        comptime for c in range(C):
+            values[c] = Float32(
+                qkv_conv_output.load[width=1]((t, value_base + column + c))
+            )
+        var decay_value = Float32(
+            decay_per_token.load[width=1]((t, value_head_idx))
+        )
+        var beta_value = Float32(
+            beta_per_token.load[width=1]((t, value_head_idx))
+        )
+
+        var dots = SIMD[DType.float32, 2 * C](0.0)
+        comptime for r in range(ROWS):
+            comptime for c in range(C):
+                dots[c] = fma(state[r * C + c], k_rows[r], dots[c])
+                dots[C + c] = fma(state[r * C + c], q_rows[r], dots[C + c])
+        (partial + (sg * WARP_SIZE + lane) * 2 * C).unsafe_store(0, dots)
+        var sums = warp.lane_group_sum[num_lanes=WARP_SIZE](
+            SIMD[DType.float32, 4](
+                (q * q).reduce_add(),
+                (k * k).reduce_add(),
+                (q * k).reduce_add(),
+                0.0,
+            )
+        )
+        barrier()
+        var total = SIMD[DType.float32, 2 * C](0.0)
+        comptime for s in range(SGS):
+            total += (partial + (s * WARP_SIZE + lane) * 2 * C).unsafe_load[
+                width=2 * C
+            ]()
+        var q_factor = rsqrt(sums[0] + Float32(1e-6)) * query_scale
+        var k_inv = rsqrt(sums[1] + Float32(1e-6))
+        var a = total.slice[C, offset=0]()
+        var b = total.slice[C, offset=C]()
+        var delta = beta_value * (values - decay_value * k_inv * a)
+        var update = delta * k_inv
+        if sg == 0:
+            var readout = (decay_value * b + update * sums[2]) * q_factor
+            comptime for c in range(C):
+                recurrence_output.store(
+                    (t, value_head_idx * VALUE_HEAD_DIM + column + c),
+                    Scalar[work_dtype](readout[c]),
+                )
+        comptime for r in range(ROWS):
+            comptime for c in range(C):
+                state[r * C + c] = fma(
+                    k_rows[r], update[c], state[r * C + c] * decay_value
+                )
+        # The next token's partials overwrite these, so every sub-group
+        # must have read them first.
+        barrier()
+
+    comptime for r in range(ROWS):
+        var pair = SIMD[state_dtype, C](0)
+        comptime for c in range(C):
+            pair[c] = Scalar[state_dtype](state[r * C + c])
+        recurrent_state.store[width=C](
+            (slot, value_head_idx, first_row + r, column), pair
+        )
 
 
 # ===----------------------------------------------------------------------=== #
