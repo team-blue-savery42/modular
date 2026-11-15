@@ -27,6 +27,11 @@ llvm_source.configure(
         # Don't merge stores into HVX vectors without auto-HVX:
         # https://github.com/llvm/llvm-project/pull/242323
         "//bazel/public-patches:llvm-hexagon-store-merge-no-autohvx.patch",
+        # The SPIR-V backend reads a formal argument for every constant pointer
+        # argument of a call, past the end for a variadic one such as a string
+        # passed to OpenCL printf (an assertion, or an out-of-range read).
+        # Found by the Intel plugin; not yet reported upstream.
+        "//bazel/public-patches:llvm-spirv-variadic-constant-ptr-arg.patch",
         # libLLVM (llvm-shared.patch) whole-archives only its direct deps, and
         # nothing in it calls SPIRVTranslateModule, which also lacked LLVM_ABI
         # (hidden in libLLVM); so with the SPIR-V target

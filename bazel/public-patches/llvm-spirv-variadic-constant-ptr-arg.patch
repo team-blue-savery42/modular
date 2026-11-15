@@ -1,0 +1,14 @@
+diff --git a/llvm/lib/Target/SPIRV/SPIRVEmitIntrinsics.cpp b/llvm/lib/Target/SPIRV/SPIRVEmitIntrinsics.cpp
+--- a/llvm/lib/Target/SPIRV/SPIRVEmitIntrinsics.cpp
++++ b/llvm/lib/Target/SPIRV/SPIRVEmitIntrinsics.cpp
+@@ -2423,7 +2423,9 @@
+     if (!isa<Instruction>(ArgOperand) && !isa<Argument>(ArgOperand)) {
+       // However, we may have assumptions about the formal argument's type and
+       // may have a need to insert a ptr cast for the actual parameter of this
+-      // call.
++      // call. A variadic argument has no formal argument to check.
++      if (OpIdx >= CalledF->arg_size())
++        continue;
+       Argument *CalledArg = CalledF->getArg(OpIdx);
+       if (!GR->findDeducedElementType(CalledArg))
+         continue;
