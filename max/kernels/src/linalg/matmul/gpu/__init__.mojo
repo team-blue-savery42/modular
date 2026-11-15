@@ -94,6 +94,7 @@ from .amd_rdna import (
     gemm_kernel_rdna_epilogue_fn,
 )
 from .apple import enqueue_apple_matmul_8x8
+from .intel import matmul_dispatch_intel
 from .sm80.dispatch import create_matmul_configs_ampere
 from .sm90.dispatch import matmul_dispatch_sm90
 from .sm100_structured.default.dispatch import matmul_dispatch_sm100
@@ -1108,6 +1109,19 @@ def _matmul_gpu_impl[
                 ](c, a, b, m, n, k, ctx, epilogue_fn, compute_fn)
                 return
 
+    # Intel Xe2: the DPAS GEMMs of `intel/`. They decline other types,
+    # layouts and shapes, which carry on below to the GEMV (M or N = 1) or
+    # the naive kernel: the tensor-core and vendor BLAS paths leave Intel
+    # out (they can't compile or link for it).
+    comptime if ctx.default_device_info.api == "level_zero":
+        if matmul_dispatch_intel[
+            transpose_b=transpose_b,
+            has_epilogue_fn=has_epilogue_fn,
+            has_compute_fn=has_compute_fn,
+        ](c, a, b, epilogue_fn, compute_fn, ctx):
+            logger.info("Executing: Intel GEMM kernel")
+            return
+
     @inline(.always)
     def _vendor_dispatch() raises {imm}:
         comptime if has_epilogue_fn:
@@ -1159,6 +1173,10 @@ def _matmul_gpu_impl[
         matmul_supported_format
         and has_accelerator()
         and not ctx.target.is_apple_gpu()
+        # Intel: these kernels use NVIDIA's and AMD's `mma` shapes, which
+        # Intel's `mma` (DPAS) rejects at compile time; the Intel branch
+        # above has run what it takes.
+        and ctx.default_device_info.api != "level_zero"
         and use_tensor_core
         and has_static_NK
     ):
@@ -1958,6 +1976,11 @@ def _matmul_gpu_impl[
         and c_type in vendor_blas_fallback_dtypes
         and not ctx.target.is_apple_gpu()
         and not has_amd_rdna_gpu_accelerator()
+        # Intel: MAX has no vendor BLAS for Level Zero (`vendor/blas.mojo`
+        # resolves cuBLAS), and its `KernelLoadScope` names AsyncRT symbols
+        # that the HAL's DeviceContext doesn't provide, so the JIT can't link
+        # a program that only references it.
+        and ctx.default_device_info.api != "level_zero"
         # `MODULAR_DISABLE_VENDOR_FALLBACK=1` disables this, but it is a
         # kernel-compile define rather than an environment read: pass
         # `-D MODULAR_DISABLE_VENDOR_FALLBACK=1` to `mojo`, or set the variable
