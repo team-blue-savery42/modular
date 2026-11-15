@@ -97,6 +97,10 @@ from .apple.naive_fa_decode import (
     naive_fa_decode_apple_supports_depth,
 )
 from .apple.fa_prefill import FA_PREFILL_APPLE_MAX_HEAD_DIM, fa_prefill_apple
+from .intel.flash_attention import (
+    intel_fa_supported,
+    intel_flash_attention,
+)
 from .amd_structured.attention import Attention
 from .amd_structured.config import (
     _MHA_DECODE_FOLD_MAX_ROWS,
@@ -960,6 +964,10 @@ def _apple_naive_fa_decode_enabled() -> Bool:
 
 def _apple_fa_prefill_enabled() -> Bool:
     return getenv("MODULAR_ENABLE_APPLE_FA_PREFILL", "1") != "0"
+
+
+def _intel_fa_enabled() -> Bool:
+    return getenv("MODULAR_ENABLE_INTEL_FA", "1") != "0"
 
 
 @inline(.always)
@@ -2277,6 +2285,62 @@ def flash_attention_dispatch[
                         ctx,
                         sink_weights,
                     )
+        elif (
+            ctx.default_device_info.api == "level_zero"
+            and ragged
+            and not sink
+            and output.dtype == dtype
+            and not k_t.quantization_enabled
+            and k_t.v_col_base == 0
+            and intel_fa_supported[
+                dtype, depth, group, k_t.page_size, k_t.dtype
+            ]()
+        ):
+            # Intel: DPAS flash attention over a paged KV cache (prefill, and
+            # split-K decode with a stitch); everything else stays naive.
+            if _intel_fa_enabled():
+                intel_flash_attention[
+                    depth=depth,
+                    num_heads=num_heads,
+                    group=group,
+                    _is_cache_length_accurate=_is_cache_length_accurate,
+                ](
+                    q,
+                    k,
+                    v,
+                    mask_functor,
+                    output,
+                    valid_length.value(),
+                    scale,
+                    batch_size,
+                    max_prompt_len,
+                    max_cache_valid_length,
+                    is_token_generation,
+                    ctx,
+                )
+            else:
+                mha_gpu_naive[
+                    ragged=ragged,
+                    _use_valid_length=_use_valid_length,
+                    _is_cache_length_accurate=_is_cache_length_accurate,
+                    sink=sink,
+                ](
+                    q,
+                    k,
+                    v,
+                    mask_functor,
+                    output,
+                    valid_length,
+                    scale,
+                    batch_size,
+                    max_prompt_len,
+                    max_cache_valid_length,
+                    num_heads,
+                    depth,
+                    group,
+                    ctx,
+                    sink_weights,
+                )
         else:
             mha_gpu_naive[
                 ragged=ragged,
