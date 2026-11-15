@@ -144,6 +144,69 @@ trait _DispatchEnqueuer:
         ...
 
 
+def _fill_constant_memory(
+    stream: ArcPointer[Stream[get_device_spec[0]()]],
+    context: ArcPointer[Context[get_device_spec[0]()]],
+    func: FunctionHandle,
+    constant_memory: List[ConstantMemoryMapping],
+) raises:
+    """Copies each constant memory mapping into the global of the same name in
+    the loaded function's module, on the launch's stream, before the launch.
+
+    This is what the legacy CUDA path does with `cuModuleGetGlobal` and an
+    asynchronous host-to-device copy. The plugin reports the global through
+    the function properties `global_address:NAME` and `global_size:NAME`
+    (uint64); a mapping whose global the plugin doesn't report is refused
+    rather than silently dropped.
+    """
+    for mapping in constant_memory:
+        var name = String(mapping.name)
+        var address = context[].get_optional_function_property(
+            func, String("global_address:", name)
+        )
+        var size = context[].get_optional_function_property(
+            func, String("global_size:", name)
+        )
+        if not address or not size:
+            raise Error(
+                String(
+                    "HAL DeviceContext.enqueue_function: the driver exposes no",
+                    " global `",
+                    name,
+                    "` for a `constant_memory` mapping (function properties",
+                    " `global_address:` and `global_size:`).",
+                )
+            )
+        if mapping.byte_count < 0 or UInt64(mapping.byte_count) > size.value():
+            raise Error(
+                String(
+                    "HAL DeviceContext.enqueue_function: `constant_memory`",
+                    " mapping `",
+                    name,
+                    "` has ",
+                    mapping.byte_count,
+                    " bytes, but the global has ",
+                    size.value(),
+                    ".",
+                )
+            )
+        if mapping.byte_count == 0:
+            continue
+        # Non-owning: the module owns the global. The copy reads the view's
+        # address when it is enqueued, so the wrapper can go right after.
+        var buffer = context[].wrap_memory(
+            address.value(), UInt64(mapping.byte_count)
+        )
+        try:
+            stream[].copy_to_device(
+                buffer.view(), mapping.ptr.unsafe_bitcast[UInt8]()
+            )
+        except e:
+            context[].free_sync(buffer^)
+            raise e^
+        context[].free_sync(buffer^)
+
+
 @fieldwise_init
 struct _DeviceFunctionInner(Movable):
     """Wrapper around a HAL-loaded `FunctionHandle`.
@@ -384,14 +447,15 @@ struct DeviceFunction[
             # Launch `attributes` (e.g. PDL / programmatic stream
             # serialization, cluster dimensions) are forwarded to the plugin
             # via the attribute array assembled below. `constant_memory`
-            # mappings DO change semantics and are not yet plumbed through, so
-            # refuse them rather than silently dropping them.
+            # mappings are copied into their globals on the stream first.
             if case .Some(cluster_dim) = cluster_dim:
                 attributes.append(LaunchAttribute.from_cluster_dim(cluster_dim))
             if constant_memory:
-                raise Error(
-                    "HAL DeviceContext.enqueue_function does not support"
-                    " `constant_memory` mappings."
+                _fill_constant_memory(
+                    ctx._hal_stream(),
+                    self._impl._inner[]._context,
+                    self._impl._inner[]._func_handle,
+                    constant_memory,
                 )
             debug_assert(
                 shared_mem_bytes.or_else(0) >= 0,
@@ -1056,15 +1120,16 @@ struct DeviceExternalFunction[
     ) raises where not use_legacy_backend():
         # Launch `attributes` (e.g. PDL / programmatic stream serialization,
         # cluster dimensions) are forwarded to the plugin via the attribute
-        # array assembled below. `constant_memory` mappings DO change
-        # semantics and are not yet plumbed through, so refuse them rather
-        # than silently dropping them.
+        # array assembled below. `constant_memory` mappings are copied into
+        # their globals on the stream first.
         if case .Some(cluster_dim) = cluster_dim:
             attributes.append(LaunchAttribute.from_cluster_dim(cluster_dim))
         if constant_memory:
-            raise Error(
-                "HAL DeviceContext.enqueue_function does not support"
-                " `constant_memory` mappings."
+            _fill_constant_memory(
+                stream,
+                self._impl._ctx._impl._context,
+                self._impl._inner[]._func_handle,
+                constant_memory,
             )
 
         comptime num_args = Ts.length

@@ -395,6 +395,18 @@ struct RawPluginBase[required: Bool = True](RawPluginComponent):
         ) thin abi("C") -> PluginResultCode,
         required=Self.required,
     ]
+    var function_property: HALFunction[
+        "M_driver_function_property",
+        def[
+            value_origin: MutOrigin
+        ](
+            context: ContextHandle,
+            function: FunctionHandle,
+            property_name: CStringSpan[_],
+            value: OpaquePointer[value_origin],
+        ) thin abi("C") -> PluginResultCode,
+        required=Self.required,
+    ]
     # The array parameters mirror the C header's `const uint64_t *` /
     # `const uint32_t *` types; the device address is a `uint64_t` like the
     # other device-address parameters in the ABI.
