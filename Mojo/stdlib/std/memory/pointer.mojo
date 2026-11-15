@@ -1932,9 +1932,13 @@ struct Pointer[
             alignment.is_power_of_two()
         ), "alignment must be a power of two integer value"
 
-        comptime if not CurrentPlugin.has_generic_address_space:
+        comptime if not CurrentPlugin.has_generic_address_space or (
+            Self.address_space != .GENERIC and Self.address_space != .GLOBAL
+        ):
             # The vector path below rebuilds lane pointers from `Int(self)`,
             # which loses the address space, so load through `self` instead.
+            # `Int(self)` on a shared or local pointer is an offset into its
+            # window, not a generic address.
             var result = default
             comptime for i in range(width):
                 if mask[i]:
