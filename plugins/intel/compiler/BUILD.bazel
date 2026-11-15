@@ -26,11 +26,13 @@ modular_cc_library(
         "Convergent.cpp",
         "RemapAddressSpaces.cpp",
         "SPIRVBinary.cpp",
+        "SubgroupSize.cpp",
     ],
     hdrs = [
         "Convergent.h",
         "RemapAddressSpaces.h",
         "SPIRVBinary.h",
+        "SubgroupSize.h",
     ],
     includes = ["."],
     deps = [
@@ -143,6 +145,23 @@ modular_cc_test(
     name = "RemapAddressSpacesTest",
     size = "small",
     srcs = ["test/RemapAddressSpacesTest.cpp"],
+    deps = [
+        ":IntelPasses",
+        "@llvm-project//llvm:AsmParser",
+        "@llvm-project//llvm:Core",
+        "@llvm-project//llvm:MC",
+        "@llvm-project//llvm:SPIRVCodeGen",
+        "@llvm-project//llvm:SPIRVInfo",
+        "@llvm-project//llvm:Support",
+        "@llvm-project//llvm:Target",
+        "@llvm-project//llvm:TargetParser",
+    ],
+)
+
+modular_cc_test(
+    name = "SubgroupSizeTest",
+    size = "small",
+    srcs = ["test/SubgroupSizeTest.cpp"],
     deps = [
         ":IntelPasses",
         "@llvm-project//llvm:AsmParser",

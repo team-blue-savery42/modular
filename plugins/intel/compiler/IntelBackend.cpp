@@ -26,6 +26,7 @@
 #include "IntelTraits.h"
 #include "RemapAddressSpaces.h"
 #include "SPIRVBinary.h"
+#include "SubgroupSize.h"
 
 #include "Mojo/ToolCommon/CompilationOptions.h"
 #include "Target/Host/HostBackend.h"
@@ -99,6 +100,8 @@ public:
                                 llvm::StringRef) const override {
     CompilationOptions adjusted = options;
     adjusted.targetCpu.clear();
+    // The plugin's own features (the sub-group size) aren't LLVM's.
+    adjusted.targetFeatures = withoutPluginFeatures(options.targetFeatures);
     return adjusted;
   }
 
@@ -113,6 +116,10 @@ public:
       // the driver can't link. OpenCL's own built-ins aren't LLVM libcalls.
       func.addFnAttr("no-builtins");
     }
+    // A warp is a sub-group of the size MAX's WARP_SIZE has for the target:
+    // 16, or 32 for a `+sub-group-size-32` target.
+    if (setSubgroupSizes(module))
+      trace("backend: a kernel runs at sub-group size 32");
     // Before the optimizer: it must not make a barrier or sub-group
     // operation control dependent on more values.
     if (markConvergentFunctions(module))
