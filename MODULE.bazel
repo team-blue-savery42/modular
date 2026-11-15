@@ -25,7 +25,16 @@ use_repo(crate, "crates")
 
 mojo_aliases = use_repo_rule("//bazel:mojo_aliases.bzl", "mojo_aliases")
 
-mojo_aliases(name = "mojo")
+mojo_aliases(
+    name = "mojo",
+    # Under --//:hal_device_context=true, `max` is the HAL DeviceContext (the
+    # compat layer), and every Mojo library depending on //max:max_mojo must
+    # build against it, or a test hands its HAL `DeviceBuffer` to a kernel
+    # library expecting the legacy one. (Mirrors the internal generated alias.)
+    overrides = {
+        "max_mojo": 'select({"//:hal_device_context_enabled": "//max/mojo/max/_driver/max_license:max", "//conditions:default": "//max/mojo/max:max"})',
+    },
+)
 
 macos_sysroot_repository = use_repo_rule("//bazel/internal/cc-toolchain:macos_sysroot_repository.bzl", "macos_sysroot_repository")
 
