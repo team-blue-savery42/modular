@@ -21,6 +21,7 @@
 
 #include "IntelBackend.h"
 
+#include "Convergent.h"
 #include "IntelAddressSpace.h"
 #include "IntelTraits.h"
 #include "RemapAddressSpaces.h"
@@ -112,6 +113,10 @@ public:
       // the driver can't link. OpenCL's own built-ins aren't LLVM libcalls.
       func.addFnAttr("no-builtins");
     }
+    // Before the optimizer: it must not make a barrier or sub-group
+    // operation control dependent on more values.
+    if (markConvergentFunctions(module))
+      trace("backend: marked group built-ins and their callers convergent");
     if (llvm::Error err = remapAddressSpacesForSPIRV(module)) {
       std::string message = llvm::toString(std::move(err));
       trace("backend: address-space renumbering failed: " + message);
