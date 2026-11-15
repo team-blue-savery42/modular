@@ -21,6 +21,7 @@ from std.collections import OptionalReg
 from std.math import align_up, ceildiv, iota
 from std.os import getenv
 from std.random import seed
+from std.sys.defines import get_defined_int
 from std.sys.info import CompilationTarget, _accelerator_arch, size_of
 import extensibility
 
@@ -32,6 +33,7 @@ from internal_utils.fp8_utils import cast_saturating
 
 from comm import Signal
 from extensibility import StaticTensorSpec
+from max.gpu import WARP_SIZE
 from max.gpu.host import (
     CompletionFlag,
     DeviceBuffer,
@@ -140,7 +142,13 @@ from state_space.gated_delta_conv1d import (
     gated_delta_conv1d_fwd_gpu,
 )
 from state_space.gated_delta import (
+    GATED_DELTA_INTEL_COLUMNS,
+    GATED_DELTA_INTEL_DECODE_COLUMNS,
+    GATED_DELTA_INTEL_DECODE_SUB_GROUPS,
+    GATED_DELTA_INTEL_SUB_GROUPS,
+    gated_delta_recurrence_decode_intel_gpu,
     gated_delta_recurrence_fwd_gpu,
+    gated_delta_recurrence_fwd_intel_gpu,
     gated_delta_recurrence_verify_ring_gpu,
     gated_delta_ring_record_elements,
     gated_delta_state_fold_gpu,
@@ -5248,6 +5256,97 @@ struct GatedDeltaRecurrenceFwd:
         # compiled (Qwen3.5 default). To support a new model with different
         # head dims, add a further elif branch here following the same pattern.
         if shape.key_head_dim == 128 and shape.value_head_dim == 128:
+            comptime if ctx.default_device_info.api == "level_zero":
+                # Intel (measured on the B70): a prefill (some sequence
+                # longer than one token) runs on sub-groups over the key rows
+                # with the tokens staged in shared memory; at 16 heads, 512
+                # tokens 223 us against 909 us here. Decode runs on
+                # lanes over the state columns, sub-groups over the key rows;
+                # `-D gated_delta_intel_decode=0` keeps the kernel below.
+                comptime intel_decode = get_defined_int[
+                    "gated_delta_intel_decode", 1
+                ]()
+                if (
+                    intel_decode != 0
+                    and Int(recurrence_output_tt.dim[0]()) <= shape.batch_size
+                ):
+                    comptime kKD = 128
+                    comptime kVD = 128
+                    ctx.enqueue_function[
+                        gated_delta_recurrence_decode_intel_gpu[
+                            work_dtype,
+                            state_dtype,
+                            kKD,
+                            kVD,
+                            recurrence_output_tt.LayoutType,
+                            qkv_conv_output_tt.LayoutType,
+                            decay_per_token_tt.LayoutType,
+                            beta_per_token_tt.LayoutType,
+                            recurrent_state_tt.LayoutType,
+                            slot_idx_tt.LayoutType,
+                            input_row_offsets_tt.LayoutType,
+                            recurrence_output_tt.Engine,
+                        ]
+                    ](
+                        Int32(shape.batch_size),
+                        Int32(shape.num_value_heads),
+                        Int32(shape.num_key_heads),
+                        Int32(shape.key_dim),
+                        recurrence_output_tt,
+                        recurrent_state_tt,
+                        slot_idx_tt,
+                        qkv_conv_output_tt,
+                        decay_per_token_tt,
+                        beta_per_token_tt,
+                        input_row_offsets_tt,
+                        grid_dim=(
+                            shape.batch_size
+                            * shape.num_value_heads
+                            * (kVD // GATED_DELTA_INTEL_DECODE_COLUMNS),
+                        ),
+                        block_dim=(
+                            GATED_DELTA_INTEL_DECODE_SUB_GROUPS * WARP_SIZE,
+                        ),
+                    )
+                    return
+                if Int(recurrence_output_tt.dim[0]()) > shape.batch_size:
+                    comptime kKD = 128
+                    comptime kVD = 128
+                    ctx.enqueue_function[
+                        gated_delta_recurrence_fwd_intel_gpu[
+                            work_dtype,
+                            state_dtype,
+                            kKD,
+                            kVD,
+                            recurrence_output_tt.LayoutType,
+                            qkv_conv_output_tt.LayoutType,
+                            decay_per_token_tt.LayoutType,
+                            beta_per_token_tt.LayoutType,
+                            recurrent_state_tt.LayoutType,
+                            slot_idx_tt.LayoutType,
+                            input_row_offsets_tt.LayoutType,
+                            recurrence_output_tt.Engine,
+                        ]
+                    ](
+                        Int32(shape.batch_size),
+                        Int32(shape.num_value_heads),
+                        Int32(shape.num_key_heads),
+                        Int32(shape.key_dim),
+                        recurrence_output_tt,
+                        recurrent_state_tt,
+                        slot_idx_tt,
+                        qkv_conv_output_tt,
+                        decay_per_token_tt,
+                        beta_per_token_tt,
+                        input_row_offsets_tt,
+                        grid_dim=(
+                            shape.batch_size
+                            * shape.num_value_heads
+                            * (kVD // GATED_DELTA_INTEL_COLUMNS),
+                        ),
+                        block_dim=(GATED_DELTA_INTEL_SUB_GROUPS * WARP_SIZE,),
+                    )
+                    return
             comptime kKD = 128
             comptime kVD = 128
             ctx.enqueue_function[
