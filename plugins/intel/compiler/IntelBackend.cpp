@@ -22,6 +22,7 @@
 #include "IntelBackend.h"
 
 #include "Abort.h"
+#include "ConstantMemory.h"
 #include "Convergent.h"
 #include "Heap.h"
 #include "IntelAddressSpace.h"
@@ -192,6 +193,8 @@ protected:
     expandGlobalAddressSpaceCasts(module);
     retypeAggregatePointers(module);
     flattenZeroLengthArrayGEPs(module);
+    // After the optimizer, which may have removed every use of one.
+    defineConstantImports(module);
     // After the optimizer too, so that each one defined is still called; a
     // module that doesn't allocate gets no heap global.
     defineHeapFunctions(module);
