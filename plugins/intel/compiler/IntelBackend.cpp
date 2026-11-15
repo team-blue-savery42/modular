@@ -33,6 +33,7 @@
 #include "RemapAddressSpaces.h"
 #include "SPIRVBinary.h"
 #include "SubgroupSize.h"
+#include "WideVectors.h"
 #include "ZeroLengthArrays.h"
 
 #include "Mojo/ToolCommon/CompilationOptions.h"
@@ -200,6 +201,7 @@ protected:
     flattenNestedStructArguments(module);
     promoteBFloat16(module);
     expandStepVectors(module);
+    splitWideVectors(module);
     expandGlobalAddressSpaceCasts(module);
     retypeAggregatePointers(module);
     flattenZeroLengthArrayGEPs(module);

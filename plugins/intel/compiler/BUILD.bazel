@@ -33,6 +33,7 @@ modular_cc_library(
         "RemapAddressSpaces.cpp",
         "SPIRVBinary.cpp",
         "SubgroupSize.cpp",
+        "WideVectors.cpp",
         "ZeroLengthArrays.cpp",
     ],
     hdrs = [
@@ -46,6 +47,7 @@ modular_cc_library(
         "RemapAddressSpaces.h",
         "SPIRVBinary.h",
         "SubgroupSize.h",
+        "WideVectors.h",
         "ZeroLengthArrays.h",
     ],
     includes = ["."],
@@ -187,6 +189,18 @@ modular_cc_test(
     deps = [
         ":IntelPasses",
         "@llvm-project//llvm:Analysis",
+        "@llvm-project//llvm:AsmParser",
+        "@llvm-project//llvm:Core",
+        "@llvm-project//llvm:Support",
+    ],
+)
+
+modular_cc_test(
+    name = "WideVectorsTest",
+    size = "small",
+    srcs = ["test/WideVectorsTest.cpp"],
+    deps = [
+        ":IntelPasses",
         "@llvm-project//llvm:AsmParser",
         "@llvm-project//llvm:Core",
         "@llvm-project//llvm:Support",
