@@ -23,6 +23,7 @@
 
 #include "Abort.h"
 #include "Convergent.h"
+#include "Heap.h"
 #include "IntelAddressSpace.h"
 #include "IntelTraits.h"
 #include "RemapAddressSpaces.h"
@@ -191,6 +192,9 @@ protected:
     expandGlobalAddressSpaceCasts(module);
     retypeAggregatePointers(module);
     flattenZeroLengthArrayGEPs(module);
+    // After the optimizer too, so that each one defined is still called; a
+    // module that doesn't allocate gets no heap global.
+    defineHeapFunctions(module);
     dropUnusedAbortFlag(module);
     returnAfterAbort(module);
     return llvm::Error::success();
