@@ -741,16 +741,36 @@ def _block_reduce_value_count[
     # block_size = 1024 and WARP_SIZE = 32, then only the first 32 threads from warp 0
     # will have valid results).
     var block_accum: ValueCount[T]
-    var thread_in_final_warp = thread_idx.x < ufloordiv(block_dim.x, WARP_SIZE)
+    comptime if num_warps_needed <= WARP_SIZE:
+        var thread_in_final_warp = thread_idx.x < ufloordiv(
+            block_dim.x, WARP_SIZE
+        )
 
-    if thread_in_final_warp:
-        block_accum = {
-            value = value_sram[lane_id() * value_width],
-            count = count_sram[lane_id() * count_width],
-        }
+        if thread_in_final_warp:
+            block_accum = {
+                value = value_sram[lane_id() * value_width],
+                count = count_sram[lane_id() * count_width],
+            }
+        else:
+            # Initialize unused threads with zeros (identity for sum).
+            block_accum = {value = Scalar[T](0), count = 0}
     else:
-        # Initialize unused threads with zeros (identity for sum).
+        # More warps than lanes (a 1024-thread block of 16-wide sub-groups
+        # on Intel GPUs: 64 partial sums): each lane of warp 0 adds every
+        # WARP_SIZE-th partial, so the final warp reduction sums all of them.
         block_accum = {value = Scalar[T](0), count = 0}
+        if warp == 0:
+            var active_warps = ufloordiv(block_dim.x, WARP_SIZE)
+            comptime per_lane = (num_warps_needed + WARP_SIZE - 1) // WARP_SIZE
+            comptime for j in range(per_lane):
+                var slot = lane_id() + j * WARP_SIZE
+                if slot < active_warps:
+                    block_accum = {
+                        value = block_accum.value
+                        + value_sram[slot * value_width],
+                        count = block_accum.count
+                        + count_sram[slot * count_width],
+                    }
 
     # Perform final warp-level reduction.
     var result = _warp_reduce_value_count(block_accum)

@@ -100,14 +100,28 @@ def block_reduce[
     if warp_id == 0:
         var block_m2 = Scalar[dtype](0)
 
-        # Only read lanes corresponding to active warps to avoid
-        # reading uninitialized shared memory.
-        if lane_idx < ufloordiv(block_dim.x, WARP_SIZE):
-            block_m2 = m2_shared[lane_idx]
+        comptime if max_warps_per_block > WARP_SIZE:
+            # More warps than lanes (16-lane sub-groups, 1,024 work-items):
+            # each lane folds every `WARP_SIZE`th warp's value, then the warp
+            # reduces its lanes (a butterfly over `max_warps_per_block` lanes
+            # would shuffle past the warp).
+            comptime for j in range(ceildiv(max_warps_per_block, WARP_SIZE)):
+                var i = j * WARP_SIZE + lane_idx
+                if i < ufloordiv(block_dim.x, WARP_SIZE):
+                    block_m2 += m2_shared[i]
+            block_m2 = warp.sum(block_m2)
+        else:
+            # Only read lanes corresponding to active warps to avoid
+            # reading uninitialized shared memory.
+            if lane_idx < ufloordiv(block_dim.x, WARP_SIZE):
+                block_m2 = m2_shared[lane_idx]
 
-        # On some GPUs, the warp-level reduction implicitly requires all lanes
-        # to participate in the reduction. Otherwise, we would get deadlocks.
-        block_m2 = warp.lane_group_sum[num_lanes=max_warps_per_block](block_m2)
+            # On some GPUs, the warp-level reduction implicitly requires all
+            # lanes to participate in the reduction. Otherwise, we would get
+            # deadlocks.
+            block_m2 = warp.lane_group_sum[num_lanes=max_warps_per_block](
+                block_m2
+            )
 
         if lane_idx == 0:
             m2_broadcast[0] = block_m2
@@ -146,16 +160,26 @@ def block_reduce_dual_sum[
         var block_sum0 = Scalar[dtype](0)
         var block_sum1 = Scalar[dtype](0)
 
-        if lane_idx < ufloordiv(block_dim.x, WARP_SIZE):
-            block_sum0 = shared0[lane_idx]
-            block_sum1 = shared1[lane_idx]
+        comptime if max_warps_per_block > WARP_SIZE:
+            # More warps than lanes: as in `block_reduce`.
+            comptime for j in range(ceildiv(max_warps_per_block, WARP_SIZE)):
+                var i = j * WARP_SIZE + lane_idx
+                if i < ufloordiv(block_dim.x, WARP_SIZE):
+                    block_sum0 += shared0[i]
+                    block_sum1 += shared1[i]
+            block_sum0 = warp.sum(block_sum0)
+            block_sum1 = warp.sum(block_sum1)
+        else:
+            if lane_idx < ufloordiv(block_dim.x, WARP_SIZE):
+                block_sum0 = shared0[lane_idx]
+                block_sum1 = shared1[lane_idx]
 
-        block_sum0 = warp.lane_group_sum[num_lanes=max_warps_per_block](
-            block_sum0
-        )
-        block_sum1 = warp.lane_group_sum[num_lanes=max_warps_per_block](
-            block_sum1
-        )
+            block_sum0 = warp.lane_group_sum[num_lanes=max_warps_per_block](
+                block_sum0
+            )
+            block_sum1 = warp.lane_group_sum[num_lanes=max_warps_per_block](
+                block_sum1
+            )
 
         if lane_idx == 0:
             broadcast0[0] = block_sum0
@@ -233,14 +257,17 @@ def welford_block_all_reduce[
     mut res_m2: Scalar[dtype],
     mut res_count: Scalar[dtype],
 ):
+    # One slot per warp of the largest block (1,024 work-items): with
+    # 16-lane sub-groups that is 64 warps, more than `WARP_SIZE` slots.
+    comptime max_warps = max(WARP_SIZE, 1024 // WARP_SIZE)
     var mean_shared = unsafe_stack_allocation[
-        WARP_SIZE, dtype, address_space=.SHARED
+        max_warps, dtype, address_space=.SHARED
     ]()
     var m2_shared = unsafe_stack_allocation[
-        WARP_SIZE, dtype, address_space=.SHARED
+        max_warps, dtype, address_space=.SHARED
     ]()
     var count_shared = unsafe_stack_allocation[
-        WARP_SIZE, dtype, address_space=.SHARED
+        max_warps, dtype, address_space=.SHARED
     ]()
     var mean_broadcast = unsafe_stack_allocation[
         1, dtype, address_space=.SHARED
@@ -269,14 +296,32 @@ def welford_block_all_reduce[
     barrier()
 
     if warp_idx == 0:
-        if thread_idx.x < ufloordiv(block_dim.x, WARP_SIZE):
-            warp_mean = mean_shared[lane_idx]
-            warp_m2 = m2_shared[lane_idx]
-            warp_count = count_shared[lane_idx]
-        else:
+        comptime if max_warps > WARP_SIZE:
+            # More warps than lanes (16-lane sub-groups): each lane combines
+            # every `WARP_SIZE`th warp's statistics first.
             warp_mean = Scalar[dtype](0)
             warp_m2 = Scalar[dtype](0)
             warp_count = Scalar[dtype](0)
+            comptime for j in range(max_warps // WARP_SIZE):
+                var i = j * WARP_SIZE + lane_idx
+                if i < ufloordiv(block_dim.x, WARP_SIZE):
+                    welford_combine(
+                        mean_shared[i],
+                        m2_shared[i],
+                        count_shared[i],
+                        warp_mean,
+                        warp_m2,
+                        warp_count,
+                    )
+        else:
+            if thread_idx.x < ufloordiv(block_dim.x, WARP_SIZE):
+                warp_mean = mean_shared[lane_idx]
+                warp_m2 = m2_shared[lane_idx]
+                warp_count = count_shared[lane_idx]
+            else:
+                warp_mean = Scalar[dtype](0)
+                warp_m2 = Scalar[dtype](0)
+                warp_count = Scalar[dtype](0)
         syncwarp()
         var block_mean = Scalar[dtype](0)
         var block_m2 = Scalar[dtype](0)
@@ -1041,7 +1086,12 @@ def rms_norm_gpu[
         # When the number of columns are less enough that they can be placed in
         # registers we do warp tiling which is a single pass to do mean/var
         # computation and normalization.
-        if cols <= 128 and dtype == .bfloat16:
+        # The 128-wide kernel covers a row with half a warp: at 16 lanes
+        # that is 64 bf16 values, so wider rows take the tiers below.
+        if (
+            cols <= min(128, (warp_size // 2) * simd_width)
+            and dtype == .bfloat16
+        ):
             # Experimentally determined to be the best - tapers off at 2.
             comptime warps_per_block = 2
             # Each warp handles 2 rows, so total rows per block is warps_per_block * 2.
