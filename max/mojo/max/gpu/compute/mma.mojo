@@ -30,6 +30,7 @@ from std.memory import bitcast
 from std.utils import StaticTuple
 from std.utils.coord import coord
 
+from max._plugin import CurrentMaxPlugin
 from max.gpu._utils import (
     _get_llvm_struct_fields,
     array_to_llvm_struct,
@@ -214,6 +215,8 @@ def mma(mut d: SIMD, a: SIMD, b: SIMD, c: SIMD):
     Supported configurations depend on the GPU architecture:
     - NVIDIA: Various combinations of FP32, FP16, BF16, and FP8 formats
     - AMD: Limited subset of FP32 and FP16 operations
+    - Other targets: the target's MAX plugin (`MaxPluginHooks.mma_fn`); Intel
+      runs DPAS on FP16 and BF16 (`arch/mma_intel.mojo`)
 
     Note:
         - All threads in a warp must execute this operation together
@@ -231,9 +234,9 @@ def mma(mut d: SIMD, a: SIMD, b: SIMD, c: SIMD):
     ]():
         _mma_apple(d, a, b, c)
     else:
-        CompilationTarget.unsupported_target_error[
-            operation=__get_current_function_name()
-        ]()
+        # Any other target's MAX plugin (Intel: `_mma_intel`); the default
+        # hook rejects `mma()` at compile time.
+        CurrentMaxPlugin.mma_fn(d, a, b, c)
 
 
 # ===------------------------------------------------------------------===#
