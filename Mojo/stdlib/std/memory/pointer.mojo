@@ -1937,6 +1937,8 @@ struct Pointer[
         ):
             # The vector path below rebuilds lane pointers from `Int(self)`,
             # which loses the address space, so load through `self` instead.
+            # `Int(self)` on a shared or local pointer is an offset into its
+            # window, not a generic address.
             var result = default
             comptime for i in range(width):
                 if mask[i]:

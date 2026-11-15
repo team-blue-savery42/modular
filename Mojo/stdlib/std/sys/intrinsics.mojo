@@ -716,6 +716,8 @@ def strided_load[
     ):
         # The `gather` path below rebuilds lane pointers from `Int(addr)`,
         # which loses the address space, so load through `addr` instead.
+        # `Int(addr)` on a shared or local pointer is an offset into its
+        # window, not a generic address.
         var result = SIMD[dtype, simd_width]()
         comptime for i in range(simd_width):
             if mask[i]:
@@ -771,6 +773,8 @@ def strided_store[
     ):
         # The `scatter` path below rebuilds lane pointers from `Int(addr)`,
         # which loses the address space, so store through `addr` instead.
+        # `Int(addr)` on a shared or local pointer is an offset into its
+        # window, not a generic address.
         comptime for i in range(simd_width):
             if mask[i]:
                 addr.unsafe_offset(i * stride).unsafe_store(value[i])
