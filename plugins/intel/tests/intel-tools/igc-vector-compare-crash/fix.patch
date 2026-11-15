@@ -1,0 +1,17 @@
+diff --git a/IGC/Compiler/CISACodeGen/IGCVectorizer.cpp b/IGC/Compiler/CISACodeGen/IGCVectorizer.cpp
+index 97daad680..1f1100787 100644
+--- a/IGC/Compiler/CISACodeGen/IGCVectorizer.cpp
++++ b/IGC/Compiler/CISACodeGen/IGCVectorizer.cpp
+@@ -880,8 +880,10 @@ bool IGCVectorizer::handleCMPInstruction(VecArr &Slice) {
+   PRINT_LOG("Binary instruction created: ");
+   PRINT_INST_NL(CreatedInst);
+ 
+-  replaceSliceInstructionsWithExtract(Slice, CreatedInst);
+-
++  // Keep the scalar compares for their scalar users: an extractelement from a
++  // vector of i1 can't be emitted (EmitPass::emitExtract has no whole bytes per
++  // element). Vectorized selects reach the vector compare through
++  // ScalarToVector; the scalar compares die if nothing else uses them.
+   remapSliceToVector(Slice, CreatedInst, PrevVectorization);
+ 
+   return true;

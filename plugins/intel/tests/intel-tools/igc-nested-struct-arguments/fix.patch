@@ -1,0 +1,18 @@
+diff --git a/IGC/Compiler/Optimizer/OpenCLPasses/PrivateMemory/PrivateMemoryUsageAnalysis.cpp b/IGC/Compiler/Optimizer/OpenCLPasses/PrivateMemory/PrivateMemoryUsageAnalysis.cpp
+index ae0b14b8a..e08a6655e 100644
+--- a/IGC/Compiler/Optimizer/OpenCLPasses/PrivateMemory/PrivateMemoryUsageAnalysis.cpp
++++ b/IGC/Compiler/Optimizer/OpenCLPasses/PrivateMemory/PrivateMemoryUsageAnalysis.cpp
+@@ -96,6 +96,13 @@ bool PrivateMemoryUsageAnalysis::runOnFunction(Function &F) {
+         visitType(ByValTy);
+         if (m_hasPrivateMem)
+           break;
++      } else if (Arg.getType()->isStructTy()) {
++        // A struct passed by value (SPIR-V's OpTypeStruct parameter) gets an
++        // alloca from ResolveAggregateArguments after this analysis, as a byval
++        // struct does; without optimization nothing promotes it.
++        visitType(Arg.getType());
++        if (m_hasPrivateMem)
++          break;
+       }
+ 
+       // Argument uses (which could signal they are of struct type) are
