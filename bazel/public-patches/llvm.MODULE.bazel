@@ -27,6 +27,11 @@ llvm_source.configure(
         # Don't merge stores into HVX vectors without auto-HVX:
         # https://github.com/llvm/llvm-project/pull/242323
         "//bazel/public-patches:llvm-hexagon-store-merge-no-autohvx.patch",
+        # libLLVM (llvm-shared.patch) whole-archives only its direct deps, and
+        # nothing in it calls SPIRVTranslateModule, which also lacked LLVM_ABI
+        # (hidden in libLLVM); so with the SPIR-V target
+        # on, libMLIR.so (MLIR's XeVM target) failed to link. Intel only.
+        "//bazel/public-patches:llvm-spirv-dylib-codegen.patch",
     ],
 )
 
@@ -39,5 +44,6 @@ llvm_configure.configure(
         "AMDGPU",
         "Hexagon",
         "NVPTX",
+        "SPIRV",
     ],
 )
