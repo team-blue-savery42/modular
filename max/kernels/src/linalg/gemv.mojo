@@ -3799,13 +3799,19 @@ def _gemv_gpu_dispatch_impl[
 
         case GEMVAlgorithm.GevmKernel:
             logger.info("Executing: GEVM_KERNEL")
+            # The kernel's last step sums one value per warp of the block
+            # across a lane group of warps_per_block lanes, so a block holds
+            # at most warp_size warps: 32 x 32 on NVIDIA, 16 x 64 on AMD and
+            # 16 x 16 on Intel (sub-groups of 16), where a 1024-work-item
+            # block gave wrong sums.
+            comptime gevm_warps = min(WARPS_PER_BLOCK, warp_size)
             comptime if has_epilogue_fn:
                 comptime kernel = gevm_kernel_epilogue_fn[
                     c_type,
                     a_type,
                     b_type,
                     EpilogueFnType,
-                    tile_size=warp_size * WARPS_PER_BLOCK,
+                    tile_size=warp_size * gevm_warps,
                     pdl_level=pdl_level,
                 ]
                 ctx.enqueue_function[kernel](
@@ -3817,7 +3823,7 @@ def _gemv_gpu_dispatch_impl[
                     Int32(k),
                     host_args=(epilogue_fn,),
                     grid_dim=ceildiv(n, warp_size),
-                    block_dim=warp_size * WARPS_PER_BLOCK,
+                    block_dim=warp_size * gevm_warps,
                     attributes=pdl_launch_attributes(pdl_level),
                 )
             elif has_compute_fn:
@@ -3826,7 +3832,7 @@ def _gemv_gpu_dispatch_impl[
                     a_type,
                     b_type,
                     ComputeFnType,
-                    tile_size=warp_size * WARPS_PER_BLOCK,
+                    tile_size=warp_size * gevm_warps,
                     pdl_level=pdl_level,
                 ]
                 ctx.enqueue_function[kernel](
@@ -3838,7 +3844,7 @@ def _gemv_gpu_dispatch_impl[
                     Int32(k),
                     host_args=(compute_fn,),
                     grid_dim=ceildiv(n, warp_size),
-                    block_dim=warp_size * WARPS_PER_BLOCK,
+                    block_dim=warp_size * gevm_warps,
                     attributes=pdl_launch_attributes(pdl_level),
                 )
             else:
@@ -3846,7 +3852,7 @@ def _gemv_gpu_dispatch_impl[
                     c_type,
                     a_type,
                     b_type,
-                    tile_size=warp_size * WARPS_PER_BLOCK,
+                    tile_size=warp_size * gevm_warps,
                     pdl_level=pdl_level,
                 ]
                 ctx.enqueue_function[kernel](
@@ -3857,7 +3863,7 @@ def _gemv_gpu_dispatch_impl[
                     Int32(n),
                     Int32(k),
                     grid_dim=ceildiv(n, warp_size),
-                    block_dim=warp_size * WARPS_PER_BLOCK,
+                    block_dim=warp_size * gevm_warps,
                     attributes=pdl_launch_attributes(pdl_level),
                 )
 
