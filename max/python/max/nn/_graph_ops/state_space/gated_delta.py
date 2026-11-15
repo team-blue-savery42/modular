@@ -174,8 +174,9 @@ def gated_delta_conv1d_fwd(
     graph output: the pool is mutated in place.
 
     Args:
-        qkv_input_ragged: The ``[total_seq_len, conv_dim]`` projected QKV
-            input.
+        qkv_input_ragged: The ``[total_seq_len, >= conv_dim]`` projected
+            input; the first ``conv_dim`` columns are read, so the QKV part of
+            a larger projection can be passed whole.
         conv_weight: The ``[conv_dim, kernel_size]`` depthwise conv
             weights.
         conv_state: The ``[max_slots, conv_dim, kernel_size - 1]``
@@ -189,7 +190,9 @@ def gated_delta_conv1d_fwd(
             caller needs no separate SiLU launch.
 
     Returns:
-        The conv output, ``[total_seq_len, conv_dim]``.
+        The conv output, ``[total_seq_len, conv_dim]``, in float32 whatever
+        the dtype of ``qkv_input_ragged`` (a bfloat16 input is widened on
+        read).
 
     The following example convolves a ragged batch of two sequences, of
     lengths 3 and 2, on a GPU. The sequences read and update conv-state
@@ -289,7 +292,7 @@ def gated_delta_conv1d_fwd(
     """
     device = qkv_input_ragged.device
     total_seq_len = qkv_input_ragged.shape[0]
-    conv_dim = qkv_input_ragged.shape[1]
+    conv_dim = conv_weight.shape[0]
 
     conv_output_ragged_type = TensorType(
         DType.float32, [total_seq_len, conv_dim], device

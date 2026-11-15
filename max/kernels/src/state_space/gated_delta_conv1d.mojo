@@ -25,7 +25,8 @@ Tensor shapes
 -------------
 Inputs:
   qkv_input_ragged   : [total_seq_len, conv_dim]              float32
-      Flat projected QKV input, all sequences concatenated.
+      Flat projected QKV input, all sequences concatenated (or any
+      dtype `input_dtype`, widened on read).
   conv_weight        : [conv_dim, kernel_size]                float32
       Depthwise conv weights (one weight per channel per time offset).
   conv_state         : [max_slots, conv_dim, kernel_size-1]
@@ -55,6 +56,9 @@ Outputs:
    the conv output, except that under CAPTURE_INPUT a row longer than
    window_row_len writes the window ending at its last real token, before
    its num_draft_tokens drafts.)
+
+With `APPLY_SILU` the conv output is `silu(conv(x))` (the window keeps the raw
+input).
 
 Thread mapping (GPU)
 --------------------
@@ -145,7 +149,7 @@ def _row_of_token[
 
 
 def gated_delta_conv1d_fwd_gpu[
-    work_dtype: DType,  # for qkv_input_ragged / conv_weight / conv_output_ragged
+    work_dtype: DType,  # for conv_weight / conv_output_ragged / qkv_window
     state_dtype: DType,  # for the conv_state pool (typically bf16)
     KERNEL_SIZE: Int,
     CONV1D_BLOCK_DIM: Int,
@@ -160,6 +164,8 @@ def gated_delta_conv1d_fwd_gpu[
     CAPTURE_INPUT: Bool = False,
     qkv_window_LT: TensorLayout = conv_output_ragged_LT,
     APPLY_SILU: Bool = False,
+    input_dtype: DType = work_dtype,
+    TILED: Bool = False,
 ](
     batch_size: Int32,
     total_seq_len: Int32,
@@ -168,7 +174,7 @@ def gated_delta_conv1d_fwd_gpu[
     window_row_len: Int32,
     num_draft_tokens: Int32,
     qkv_input_ragged: TileTensor[
-        work_dtype, qkv_input_ragged_LT, ImmUntrackedOrigin, Engine=Engine
+        input_dtype, qkv_input_ragged_LT, ImmUntrackedOrigin, Engine=Engine
     ],
     conv_weight: TileTensor[
         work_dtype, conv_weight_LT, ImmUntrackedOrigin, Engine=Engine
@@ -207,11 +213,20 @@ def gated_delta_conv1d_fwd_gpu[
     With `APPLY_SILU` every output is `silu(conv_sum)`, the graph's SiLU on
     the fp32 sum, before the store rounds it to `work_dtype`.
 
+    `input_dtype` is the element type of `qkv_input_ragged`, widened to
+    float32 on read (the output and the weight stay in `work_dtype`); the
+    input may have more columns than the output (only the first conv_dim
+    are read, `conv_weight` fixes conv_dim). With `TILED` the grid is
+    (channel tiles, token tiles).
+
     Every thread waits for the preceding grid before it reads any operand,
     since each of them (the input, the weight, the offsets) can be that
     grid's output. The launch must carry `pdl_launch_attributes`; the grid
     releases its dependent after the last store.
     """
+    comptime assert (
+        not CAPTURE_INPUT or input_dtype == work_dtype
+    ), "capturing the input needs it in the working dtype"
     pdl_enter()
 
     comptime KERNEL_SIZE_MINUS_ONE = KERNEL_SIZE - 1
@@ -219,7 +234,22 @@ def gated_delta_conv1d_fwd_gpu[
     var _total_seq_len = Int(total_seq_len)
     var _batch_size = Int(batch_size)
     var _tokens_per_block = Int(tokens_per_block)
-    var conv_channel_idx = block_idx.y * CONV1D_BLOCK_DIM + thread_idx.x
+    # With TILED the grid is (channel tiles, token tiles) and the blocks that
+    # run together cover whole rows; otherwise (token tiles, channel tiles)
+    # the blocks that run together read the same few channels of rows a
+    # stride apart.
+    var conv_channel_idx: Int
+    var token_tile: Int
+    comptime if TILED:
+        conv_channel_idx = Int(block_idx.x) * CONV1D_BLOCK_DIM + Int(
+            thread_idx.x
+        )
+        token_tile = Int(block_idx.y)
+    else:
+        conv_channel_idx = Int(block_idx.y) * CONV1D_BLOCK_DIM + Int(
+            thread_idx.x
+        )
+        token_tile = Int(block_idx.x)
 
     # Out-of-range threads must stay converged for the warp-wide batch lookup,
     # so their reads are clamped and only their stores are suppressed.
@@ -288,7 +318,7 @@ def gated_delta_conv1d_fwd_gpu[
         row_major(Int(qkv_window.layout(qkv_window.layout.product() - 1)) + 1)
     )
 
-    var first_flat_token_idx = block_idx.x * _tokens_per_block
+    var first_flat_token_idx = token_tile * _tokens_per_block
 
     # Cached across the consecutive tokens this thread owns.
     var batch_item_idx = _row_of_token(
@@ -327,7 +357,7 @@ def gated_delta_conv1d_fwd_gpu[
         var taps = SIMD[DType.float32, Int(next_power_of_two(TILE_TAPS))](0)
         comptime for tap in range(TILE_TAPS):
             taps[tap] = Float32(
-                rebind[Scalar[work_dtype]](
+                rebind[Scalar[input_dtype]](
                     qkv_input_flat.load(
                         Coord(
                             UInt32(
@@ -408,7 +438,7 @@ def gated_delta_conv1d_fwd_gpu[
                     + input_channel_offset
                 )
                 conv_sum += Float32(
-                    rebind[Scalar[work_dtype]](
+                    rebind[Scalar[input_dtype]](
                         qkv_input_flat.load(Coord(tap_offset))
                     )
                 ) * Float32(weight_register[kernel_offset_k])
@@ -446,7 +476,7 @@ def gated_delta_conv1d_fwd_gpu[
 
                 if lookback_position >= 0:
                     input_value = Float32(
-                        rebind[Scalar[work_dtype]](
+                        rebind[Scalar[input_dtype]](
                             qkv_input_flat.load(
                                 (
                                     UInt32(
@@ -501,7 +531,7 @@ def gated_delta_conv1d_fwd_gpu[
                 var state_value: Scalar[state_dtype] = 0
                 if source_position_in_sequence >= 0:
                     state_value = Scalar[state_dtype](
-                        rebind[Scalar[work_dtype]](
+                        rebind[Scalar[input_dtype]](
                             qkv_input_flat.load(
                                 (
                                     UInt32(

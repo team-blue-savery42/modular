@@ -4691,7 +4691,8 @@ struct GatedDeltaConv1dFwd[write_state: Bool = True, silu: Bool = False]:
     `slot_idx[batch_item]`. No state-out tensor; the only output is the
     per-token conv output. The pool's dtype is independent of the working
     dtype, so the caller can keep the per-token tensors at fp32 while
-    storing the pool at the model's native dtype (bf16).
+    storing the pool at the model's native dtype (bf16). The input's dtype is
+    independent of the output's too: a bf16 input is widened on read.
 
     Parameters:
         write_state: Whether to write the updated window back to
@@ -4701,7 +4702,8 @@ struct GatedDeltaConv1dFwd[write_state: Bool = True, silu: Bool = False]:
 
     Tensor Shapes:
         - conv_output_ragged : [total_seq_len, conv_dim]                  (OUT)
-        - qkv_input_ragged   : [total_seq_len, conv_dim]
+        - qkv_input_ragged   : [total_seq_len, >= conv_dim]
+          (the first conv_dim columns are read)
         - conv_weight        : [conv_dim, kernel_size]
         - conv_state         : [max_slots, conv_dim, kernel_size-1]       (MUT)
         - slot_idx           : [batch_size]                          uint32
@@ -4733,7 +4735,7 @@ struct GatedDeltaConv1dFwd[write_state: Bool = True, silu: Bool = False]:
         comptime assert type_of(input_row_offsets).rank == 1
         Self.launch[capture_input=False](
             conv_output_ragged.to_tile_tensor(),
-            qkv_input_ragged.to_tile_tensor[work_dtype](),
+            qkv_input_ragged.to_tile_tensor(),
             conv_weight.to_tile_tensor[work_dtype](),
             conv_state.to_tile_tensor(),
             slot_idx.to_tile_tensor[.uint32](),
@@ -4747,11 +4749,12 @@ struct GatedDeltaConv1dFwd[write_state: Bool = True, silu: Bool = False]:
     def launch[
         work_dtype: DType,
         state_dtype: DType,
+        input_dtype: DType,
         //,
         capture_input: Bool,
     ](
         conv_output_ragged: TileTensor[mut=True, work_dtype, ...],
-        qkv_input_ragged: TileTensor[work_dtype, ...],
+        qkv_input_ragged: TileTensor[input_dtype, ...],
         conv_weight: TileTensor[work_dtype, ...],
         conv_state: TileTensor[mut=True, state_dtype, ...],
         slot_idx: TileTensor[DType.uint32, ...],
@@ -4778,7 +4781,7 @@ struct GatedDeltaConv1dFwd[write_state: Bool = True, silu: Bool = False]:
         comptime CONV1D_BLOCK_DIM: Int = 128
 
         var total_seq_len = Int(qkv_input_ragged.dim[0]())
-        var conv_dim = Int(qkv_input_ragged.dim[1]())
+        var conv_dim = Int(conv_weight.dim[0]())
         var kernel_size = Int(conv_weight.dim[1]())
         var batch_size = Int(slot_idx.dim[0]())
 
@@ -4859,9 +4862,18 @@ struct GatedDeltaConv1dFwd[write_state: Bool = True, silu: Bool = False]:
             )
 
         var gpu_ctx = ctx
+        # Intel (measured on the B70): tiles of up to 32 tokens in a grid
+        # whose blocks that run together cover whole rows (the kernel's
+        # `TILED`); 8-token tiles and token tiles first were 13% slower.
+        comptime tiled = ctx.default_device_info.api == "level_zero"
+        comptime max_tokens_per_block = (
+            get_defined_int[
+                "gated_delta_conv1d_intel_tokens", 32
+            ]() if tiled else CONV1D_TOKENS_PER_BLOCK
+        )
         # Average-row-length tiles keep short rows' state updates parallel.
         var tokens_per_block = min(
-            CONV1D_TOKENS_PER_BLOCK,
+            max_tokens_per_block,
             max(1, ceildiv(total_seq_len, batch_size)),
         )
         var grid_dim_tokens = ceildiv(total_seq_len, tokens_per_block)
@@ -4889,6 +4901,8 @@ struct GatedDeltaConv1dFwd[write_state: Bool = True, silu: Bool = False]:
                     capture_input,
                     qkv_window.LayoutType,
                     Self.silu,
+                    input_dtype,
+                    tiled,
                 ]
             ](
                 Int32(batch_size),
@@ -4904,7 +4918,12 @@ struct GatedDeltaConv1dFwd[write_state: Bool = True, silu: Bool = False]:
                 input_row_offsets,
                 conv_output_ragged,
                 qkv_window,
-                grid_dim=(grid_dim_tokens, grid_dim_channels),
+                grid_dim=(
+                    (grid_dim_channels, grid_dim_tokens) if tiled else (
+                        grid_dim_tokens,
+                        grid_dim_channels,
+                    )
+                ),
                 block_dim=(CONV1D_BLOCK_DIM,),
                 attributes=pdl_launch_attributes(PDLLevel.ON),
             )
@@ -4930,7 +4949,7 @@ def gated_delta_conv1d_fwd_shape(
 
     Args:
         qkv_input_ragged: Ragged QKV input tensor of shape
-            `[total_seq_len, conv_dim]`.
+            `[total_seq_len, >= conv_dim]`.
         conv_weight: Convolution filter of shape
             `[conv_dim, kernel_size]`.
         conv_state: Mutable conv-state pool of shape
@@ -4944,9 +4963,6 @@ def gated_delta_conv1d_fwd_shape(
         type_of(qkv_input_ragged).rank == 2
     ), "qkv_input_ragged must be rank 2"
     comptime assert type_of(conv_weight).rank == 2, "conv_weight must be rank 2"
-    comptime assert (
-        type_of(conv_weight).dtype == type_of(qkv_input_ragged).dtype
-    ), "qkv_input_ragged and conv_weight must share a dtype"
     comptime assert type_of(conv_state).rank == 3, "conv_state must be rank 3"
     comptime assert type_of(slot_idx).rank == 1, "slot_idx must be rank 1"
     comptime assert (
@@ -4958,8 +4974,12 @@ def gated_delta_conv1d_fwd_shape(
     comptime assert (
         type_of(input_row_offsets).dtype == .uint32
     ), "input_row_offsets dtype must be uint32"
-    # conv_output_ragged has same shape as qkv_input_ragged
-    return rebind[IndexList[2]](coord_to_index_list(qkv_input_ragged.shape()))
+    # conv_output_ragged has qkv_input_ragged's rows and one column per
+    # conv_weight row.
+    return IndexList[2](
+        Int(qkv_input_ragged.shape()[0].value()),
+        Int(conv_weight.shape()[0].value()),
+    )
 
 
 @extensibility.register("gated_delta_conv1d_verify_fwd")
