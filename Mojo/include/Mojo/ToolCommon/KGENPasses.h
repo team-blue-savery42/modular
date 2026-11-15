@@ -393,6 +393,29 @@ struct LowerToLLVMOptions
 void registerLowerToLLVMPipeline();
 
 /// Utils for emission options.
+
+/// Splits a comma-separated list of emission options (`option=value`, or a
+/// bare `flag`) into `out`, as slices of `options`. An item that starts with
+/// `+` or `-` continues the value before it, so a list-valued LLVM option
+/// such as `spirv-ext=+SPV_KHR_bfloat16,+SPV_EXT_shader_atomic_float_add`
+/// stays one option: LLVM parses each occurrence of an option into a fresh
+/// value, so repeating the option would keep only the last. Option names
+/// never start with either, so `target-abi=lp64d,some-opt` is two options.
+inline void splitEmissionOptions(llvm::StringRef options,
+                                 llvm::SmallVectorImpl<llvm::StringRef> &out) {
+  llvm::SmallVector<llvm::StringRef> items;
+  options.split(items, /*Separator=*/",", /*MaxSplit=*/-1,
+                /*KeepEmpty=*/false);
+  for (llvm::StringRef item : items) {
+    if (!out.empty() && out.back().contains('=') &&
+        (item.starts_with("+") || item.starts_with("-")))
+      out.back() =
+          llvm::StringRef(out.back().data(), item.end() - out.back().data());
+    else
+      out.push_back(item);
+  }
+}
+
 ErrorOrSuccess parseEmissionOptions(EmissionOptions emissionOptions);
 ErrorOrSuccess resetEmissionOptions(EmissionOptions emissionOptions);
 

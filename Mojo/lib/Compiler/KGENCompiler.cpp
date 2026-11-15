@@ -825,9 +825,7 @@ static ElaboratorCompileOffloadRetType compileOffloads(
       // offloads for different targets won't have to share since we compile
       // them in order and we can reset these options for each targets.
       SmallVector<StringRef> emissionOptions;
-      StringRef(offloadInfo.emissionOptions)
-          .split(emissionOptions, /*Separator=*/",",
-                 /*MaxSplit=*/-1, /*KeepEmpty=*/false);
+      splitEmissionOptions(offloadInfo.emissionOptions, emissionOptions);
       // `target-abi` was already applied to `compilationOptions.targetABI`
       // above; keep it out of the parse/reset lists so it doesn't also mutate
       // LLVM's shared, registered `-target-abi` cl option as a side effect.

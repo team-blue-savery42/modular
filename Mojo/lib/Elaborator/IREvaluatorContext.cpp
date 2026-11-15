@@ -390,8 +390,7 @@ IREvaluatorContext::evaluateCompileAssemblyAttr(CompileAssemblyAttr attr) {
 
   // Parse the emission options from a comma separated list of values.
   SmallVector<StringRef> emissionOptions;
-  emissionOptionsStr.split(emissionOptions, /*Separator=*/",",
-                           /*MaxSplit=*/-1, /*KeepEmpty=*/false);
+  splitEmissionOptions(emissionOptionsStr, emissionOptions);
 
   // Capture the diagnostics that may be emitted.
   DiagnosticHandler handler(ctx);
