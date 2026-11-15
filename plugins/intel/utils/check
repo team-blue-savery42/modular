@@ -1,0 +1,71 @@
+#!/bin/bash
+# ===----------------------------------------------------------------------=== #
+# Copyright (c) 2026, Sean Avery. All rights reserved.
+#
+# Licensed under the Apache License v2.0 with LLVM Exceptions:
+# https://llvm.org/LICENSE.txt
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ===----------------------------------------------------------------------=== #
+
+# Checks the Intel plugins on an Intel GPU host. Builds the plugins, Mojo and
+# MAX (with the HAL DeviceContext), then runs:
+#   unit      bazel test //plugins/intel/...
+#   codegen   utils/check-codegen: the codegen corpus through the compiler
+#             plugin, each binary checked with spirv-val and ocloc
+#   e2e       utils/check-e2e: Mojo programs on the GPU through the HAL
+#   graph     tests/graph/*.py: MAX graphs of the ops Qwen3.5-0.8B uses
+#   gate      utils/check-max-gpu: MAX's GPU tests against
+#             tests/max-gpu-expected.txt
+#   text      Qwen3.5-0.8B's greedy completions of four prompts (opt build)
+#             against tests/regression/qwen3.5-0.8b-greedy.txt
+# and counts GPU faults in the kernel log over the run. Each step's output is
+# in OUTDIR/<step>.log, its exit status and time in OUTDIR/result.txt.
+# Usage: plugins/intel/utils/check OUTDIR [QWEN3.5-0.8B-DIR]
+# QWEN3.5-0.8B-DIR (default ~/models/Qwen3.5-0.8B) holds a Hugging Face
+# snapshot of Qwen/Qwen3.5-0.8B; without it the text step is skipped.
+set -u
+here=$(cd "$(dirname "$0")/.." && pwd)
+modular=$(cd "$here/../.." && pwd)
+out=$(mkdir -p "$1" && cd "$1" && pwd)
+model=${2:-$HOME/models/Qwen3.5-0.8B}
+: > "$out/result.txt"
+start=$(date "+%Y-%m-%d %H:%M:%S")
+git -C "$modular" log --oneline -1 > "$out/commit.txt"
+git -C "$modular" status --short >> "$out/commit.txt"
+step() {
+  name=$1; shift
+  s=$(date +%s)
+  "$@" > "$out/$name.log" 2>&1
+  echo "$name rc=$? $(( $(date +%s) - s ))s" >> "$out/result.txt"
+}
+cd "$modular"
+step build sh -c "./bazelw build //plugins/intel/... //max/mojo/max:max //Mojo:mojo &&
+  ./bazelw build --//:hal_device_context=true //max/python/max/_entrypoints:pipelines &&
+  sh '$here/utils/make-mojo-launcher'"
+step unit ./bazelw test //plugins/intel/...
+step codegen "$here/utils/check-codegen"
+step e2e "$here/utils/check-e2e"
+for t in graph_smoke norms rope_store elementwise gated_delta attention sampling fp8_linear; do
+  step "graph-$t" "$here/utils/run-max-py" "$here/tests/graph/$t.py"
+done
+step gate "$here/utils/check-max-gpu" -o "$out/gate-table.md" --logs "$out/gate-logs" \
+  --expect "$here/tests/max-gpu-expected.txt"
+if [ -d "$model" ]; then
+  step text env GEN_FIRST_ONLY=1 RUN_MAX_PY_OPT=1 "$here/utils/run-max-py" \
+    "$here/tests/graph/gen_repeat.py" "$model" 1 64
+  if diff <(grep "^prompt " "$out/text.log") "$here/tests/regression/qwen3.5-0.8b-greedy.txt" > "$out/text.diff"; then
+    echo "text identical to tests/regression/qwen3.5-0.8b-greedy.txt" >> "$out/result.txt"
+  else
+    echo "TEXT DIFFERS (text.diff)" >> "$out/result.txt"
+  fi
+else
+  echo "text skipped: no $model" >> "$out/result.txt"
+fi
+echo "GPU fault lines: $(journalctl -k --since "$start" --no-pager 2>/dev/null | grep -c -i 'xe.*fault\|CAT error\|Engine reset')" >> "$out/result.txt"
+echo DONE >> "$out/result.txt"
+cat "$out/result.txt"
