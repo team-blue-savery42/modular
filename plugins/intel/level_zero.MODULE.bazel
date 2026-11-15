@@ -1,0 +1,18 @@
+"""Level Zero headers for the Intel driver plugin (included from MODULE.bazel).
+
+Only the headers: the plugin dlopens the system's libze_loader.so.1 at run
+time, like the CUDA and HIP plugins load their drivers. Pinned to the loader
+release on the bring-up host.
+"""
+
+http_archive = use_repo_rule("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
+
+LEVEL_ZERO_VERSION = "1.32.0"
+
+http_archive(
+    name = "level_zero_headers",
+    build_file = "//plugins/intel/driver:level_zero_headers.BUILD",
+    sha256 = "b658d3be89b2ea3c5e6b3214592acb58a4875e738184b1a4cc7e9cf878b5f7b9",
+    strip_prefix = "level-zero-{}".format(LEVEL_ZERO_VERSION),
+    url = "https://github.com/oneapi-src/level-zero/archive/refs/tags/v{}.tar.gz".format(LEVEL_ZERO_VERSION),
+)
