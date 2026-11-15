@@ -43,6 +43,7 @@ from std.sys import (
 )
 from std.sys._assembly import inlined_assembly
 from std.sys.info import (
+    CompilationTarget,
     _is_sm_9x_or_newer,
     _is_sm_100x_or_newer,
     is_apple_gpu,
@@ -2880,6 +2881,10 @@ def _load_impl[
         # TODO: KERN-1230
         comptime assert read_only == False
         return ptr.unsafe_load[width=width]()
+    elif CompilationTarget._is_triple_arch["spirv64"]():
+        # The cache operations, eviction policies and prefetch sizes below
+        # are PTX's; Intel GPUs load plainly.
+        return ptr.unsafe_load[width=width, alignment=alignment]()
 
     comptime if case .Some(prefetch_bytes) = prefetch_size:
         comptime assert prefetch_bytes in (64, 128, 256)
