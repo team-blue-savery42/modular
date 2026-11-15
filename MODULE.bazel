@@ -62,3 +62,5 @@ include("//bazel/public-patches:llvm.MODULE.bazel")
 cfg_workaround = use_repo_rule("//bazel/internal:cfg_workaround.bzl", "cfg_workaround")
 
 cfg_workaround(name = "cfg_workaround.bzl")
+
+include("//plugins/intel:level_zero.MODULE.bazel")
