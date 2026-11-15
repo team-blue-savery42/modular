@@ -24,6 +24,7 @@
 #include "Abort.h"
 #include "ConstantMemory.h"
 #include "Convergent.h"
+#include "DynamicSharedMemory.h"
 #include "Heap.h"
 #include "IntelAddressSpace.h"
 #include "IntelTraits.h"
@@ -200,7 +201,7 @@ protected:
     defineHeapFunctions(module);
     dropUnusedAbortFlag(module);
     returnAfterAbort(module);
-    return llvm::Error::success();
+    return addDynamicSharedMemoryParameter(module);
   }
 
   /// With MOJO_INTEL_PLUGIN_DUMP=<dir>, writes each module the plugin emits
