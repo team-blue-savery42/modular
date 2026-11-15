@@ -358,7 +358,10 @@ def _resolve_overlap_and_device_graph_capture(
             and runtime.enable_overlap_scheduler is not False
             and arch is not None
             and arch.supports_device_graph_capture
-            and accelerator_api() in ("cuda", "hip")
+            # Intel GPUs (level_zero) capture through their plugin's graph
+            # entry points; measured on the Arc Pro B70, capture is no
+            # slower in any serving cell and decodes faster.
+            and accelerator_api() in ("cuda", "hip", "level_zero")
             and _is_eligible_for_overlap_serve_optimizations(
                 sampling, lora, model, arch
             )
