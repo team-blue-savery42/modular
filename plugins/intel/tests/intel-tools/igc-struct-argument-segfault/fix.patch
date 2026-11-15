@@ -1,0 +1,59 @@
+diff --git a/IGC/Compiler/Optimizer/OpenCLPasses/AggregateArguments/AggregateArguments.cpp b/IGC/Compiler/Optimizer/OpenCLPasses/AggregateArguments/AggregateArguments.cpp
+index f9941db..8be5c3f 100644
+--- a/IGC/Compiler/Optimizer/OpenCLPasses/AggregateArguments/AggregateArguments.cpp
++++ b/IGC/Compiler/Optimizer/OpenCLPasses/AggregateArguments/AggregateArguments.cpp
+@@ -244,8 +244,10 @@ static Value *loadByMembers(IGCLLVM::IRBuilder<> &irBuilder, AllocaInst *base, S
+ 
+ // Each extractvalue of a scalar member becomes a load of that member. Other
+ // uses get the whole value, assembled once in the entry block.
++// The extractvalues are erased by the caller once every argument is done:
++// one of them can be the instruction entryBuilder inserts before.
+ static void replaceStructValueUses(Value *val, AllocaInst *base, SmallVectorImpl<Value *> &gepIndices,
+-                                   IGCLLVM::IRBuilder<> &entryBuilder) {
++                                   IGCLLVM::IRBuilder<> &entryBuilder, SmallVectorImpl<Instruction *> &dead) {
+   const DataLayout &DL = base->getModule()->getDataLayout();
+   Type *baseType = base->getAllocatedType();
+   Value *wholeVal = nullptr;
+@@ -256,7 +258,7 @@ static void replaceStructValueUses(Value *val, AllocaInst *base, SmallVectorImpl
+         memberIndices.push_back(entryBuilder.getInt32(i));
+ 
+       if (EVI->getType()->isAggregateType()) {
+-        replaceStructValueUses(EVI, base, memberIndices, entryBuilder);
++        replaceStructValueUses(EVI, base, memberIndices, entryBuilder, dead);
+       } else {
+         IGCLLVM::IRBuilder<> builder(EVI);
+         Value *ptr = builder.CreateInBoundsGEP(baseType, base, memberIndices);
+@@ -265,7 +267,7 @@ static void replaceStructValueUses(Value *val, AllocaInst *base, SmallVectorImpl
+         member->takeName(EVI);
+         EVI->replaceAllUsesWith(member);
+       }
+-      EVI->eraseFromParent();
++      dead.push_back(EVI);
+       continue;
+     }
+ 
+@@ -294,6 +296,7 @@ bool ResolveAggregateArguments::runOnFunction(Function &F, IGCMD::MetaDataUtils
+ 
+   bool changed = false;
+   IGCLLVM::IRBuilder<> irBuilder(&F.getEntryBlock(), F.getEntryBlock().begin());
++  SmallVector<Instruction *, 16> dead;
+ 
+   Function::arg_iterator argument = F.arg_begin();
+   for (; argument != F.arg_end(); ++argument) {
+@@ -322,11 +325,15 @@ bool ResolveAggregateArguments::runOnFunction(Function &F, IGCMD::MetaDataUtils
+       arg->replaceAllUsesWith(base);
+     } else {
+       SmallVector<Value *, 8> gepIndices{irBuilder.getInt32(0)};
+-      replaceStructValueUses(arg, base, gepIndices, irBuilder);
++      replaceStructValueUses(arg, base, gepIndices, irBuilder, dead);
+     }
+     changed = true;
+   }
+ 
++  // Nested extractvalues come before the ones they extract from.
++  for (Instruction *I : dead)
++    I->eraseFromParent();
++
+   return changed;
+ }
+ 

@@ -1,0 +1,323 @@
+; ===----------------------------------------------------------------------=== ;
+; Copyright (c) 2026, Sean Avery. All rights reserved.
+;
+; Licensed under the Apache License v2.0 with LLVM Exceptions:
+; https://llvm.org/LICENSE.txt
+;
+; Unless required by applicable law or agreed to in writing, software
+; distributed under the License is distributed on an "AS IS" BASIS,
+; WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+; See the License for the specific language governing permissions and
+; limitations under the License.
+; ===----------------------------------------------------------------------=== ;
+
+; bfloat16 (SPV_KHR_bfloat16) values that are only moved, not computed
+; on. Every kernel takes p, a buffer of 16-bit words: p[0] = a, p[1] = b
+; (bfloat16 bits), p[2] = flag (an integer, 0 or 1); results go to p[16...].
+; Each result should be one of the input or constant bit patterns.
+               OpCapability Kernel
+               OpCapability Addresses
+               OpCapability Int16
+               OpCapability Int64
+               OpCapability BFloat16TypeKHR
+               OpExtension "SPV_KHR_bfloat16"
+               OpMemoryModel Physical64 OpenCL
+               OpEntryPoint Kernel %copy "copy"
+               OpEntryPoint Kernel %convert "convert"
+               OpEntryPoint Kernel %select "select"
+               OpEntryPoint Kernel %select_const "select_const"
+               OpEntryPoint Kernel %phi_const "phi_const"
+               OpEntryPoint Kernel %store_const "store_const"
+               OpEntryPoint Kernel %convert_const "convert_const"
+               OpEntryPoint Kernel %select_i16 "select_i16"
+               OpEntryPoint Kernel %select_convert "select_convert"
+               OpEntryPoint Kernel %bitcasts "bitcasts"
+               OpEntryPoint Kernel %round_twice "round_twice"
+               OpEntryPoint Kernel %round_across "round_across"
+               OpEntryPoint Kernel %round_once_used "round_once_used"
+               OpEntryPoint Kernel %round_via_int "round_via_int"
+       %bf16 = OpTypeFloat 16 BFloat16KHR
+      %float = OpTypeFloat 32
+     %ushort = OpTypeInt 16 0
+      %ulong = OpTypeInt 64 0
+       %bool = OpTypeBool
+       %void = OpTypeVoid
+      %p_bf = OpTypePointer CrossWorkgroup %bf16
+      %p_us = OpTypePointer CrossWorkgroup %ushort
+         %fn = OpTypeFunction %void %p_bf
+    %ulong_1 = OpConstant %ulong 1
+    %ulong_2 = OpConstant %ulong 2
+   %ulong_16 = OpConstant %ulong 16
+   %ulong_17 = OpConstant %ulong 17
+   %ushort_0 = OpConstant %ushort 0
+; bit patterns 0x7f80 (+inf), 0x3fc0 (1.5), 0x7fc0 (NaN)
+     %bf_inf = OpConstant %bf16 0x1p+128
+     %bf_1_5 = OpConstant %bf16 0x1.8p+0
+     %bf_nan = OpConstant %bf16 0x1.8p+128
+    %bf_null = OpConstantNull %bf16
+%ushort_inf = OpConstant %ushort 32640
+  %float_1_5 = OpConstant %float 1.5
+
+       %copy = OpFunction %void None %fn
+        %p0 = OpFunctionParameter %p_bf
+        %l0 = OpLabel
+        %a0 = OpLoad %bf16 %p0 Aligned 2
+        %q0 = OpInBoundsPtrAccessChain %p_bf %p0 %ulong_16
+              OpStore %q0 %a0 Aligned 2
+              OpReturn
+              OpFunctionEnd
+
+    %convert = OpFunction %void None %fn
+        %p1 = OpFunctionParameter %p_bf
+        %l1 = OpLabel
+        %a1 = OpLoad %bf16 %p1 Aligned 2
+        %w1 = OpFConvert %float %a1
+        %n1 = OpFConvert %bf16 %w1
+        %q1 = OpInBoundsPtrAccessChain %p_bf %p1 %ulong_16
+              OpStore %q1 %n1 Aligned 2
+              OpReturn
+              OpFunctionEnd
+
+     %select = OpFunction %void None %fn
+        %p2 = OpFunctionParameter %p_bf
+        %l2 = OpLabel
+        %a2 = OpLoad %bf16 %p2 Aligned 2
+       %pb2 = OpInBoundsPtrAccessChain %p_bf %p2 %ulong_1
+        %b2 = OpLoad %bf16 %pb2 Aligned 2
+       %pf2 = OpInBoundsPtrAccessChain %p_bf %p2 %ulong_2
+       %pu2 = OpBitcast %p_us %pf2
+        %f2 = OpLoad %ushort %pu2 Aligned 2
+        %c2 = OpINotEqual %bool %f2 %ushort_0
+        %s2 = OpSelect %bf16 %c2 %a2 %b2
+        %t2 = OpSelect %bf16 %c2 %b2 %a2
+        %q2 = OpInBoundsPtrAccessChain %p_bf %p2 %ulong_16
+              OpStore %q2 %s2 Aligned 2
+        %r2 = OpInBoundsPtrAccessChain %p_bf %p2 %ulong_17
+              OpStore %r2 %t2 Aligned 2
+              OpReturn
+              OpFunctionEnd
+
+%select_const = OpFunction %void None %fn
+        %p3 = OpFunctionParameter %p_bf
+        %l3 = OpLabel
+        %a3 = OpLoad %bf16 %p3 Aligned 2
+       %pf3 = OpInBoundsPtrAccessChain %p_bf %p3 %ulong_2
+       %pu3 = OpBitcast %p_us %pf3
+        %f3 = OpLoad %ushort %pu3 Aligned 2
+        %c3 = OpINotEqual %bool %f3 %ushort_0
+        %s3 = OpSelect %bf16 %c3 %a3 %bf_inf
+        %t3 = OpSelect %bf16 %c3 %bf_inf %a3
+        %q3 = OpInBoundsPtrAccessChain %p_bf %p3 %ulong_16
+              OpStore %q3 %s3 Aligned 2
+        %r3 = OpInBoundsPtrAccessChain %p_bf %p3 %ulong_17
+              OpStore %r3 %t3 Aligned 2
+              OpReturn
+              OpFunctionEnd
+
+  %phi_const = OpFunction %void None %fn
+        %p4 = OpFunctionParameter %p_bf
+        %l4 = OpLabel
+        %a4 = OpLoad %bf16 %p4 Aligned 2
+       %pf4 = OpInBoundsPtrAccessChain %p_bf %p4 %ulong_2
+       %pu4 = OpBitcast %p_us %pf4
+        %f4 = OpLoad %ushort %pu4 Aligned 2
+        %c4 = OpINotEqual %bool %f4 %ushort_0
+              OpBranchConditional %c4 %m4 %j4
+        %m4 = OpLabel
+        %w4 = OpFConvert %float %a4
+        %n4 = OpFConvert %bf16 %w4
+              OpBranch %j4
+        %j4 = OpLabel
+        %h4 = OpPhi %bf16 %n4 %m4 %bf_nan %l4
+        %q4 = OpInBoundsPtrAccessChain %p_bf %p4 %ulong_16
+              OpStore %q4 %h4 Aligned 2
+              OpReturn
+              OpFunctionEnd
+
+%store_const = OpFunction %void None %fn
+        %p5 = OpFunctionParameter %p_bf
+        %l5 = OpLabel
+        %q5 = OpInBoundsPtrAccessChain %p_bf %p5 %ulong_16
+              OpStore %q5 %bf_1_5 Aligned 2
+        %r5 = OpInBoundsPtrAccessChain %p_bf %p5 %ulong_17
+              OpStore %r5 %bf_null Aligned 2
+              OpReturn
+              OpFunctionEnd
+
+%convert_const = OpFunction %void None %fn
+        %p6 = OpFunctionParameter %p_bf
+        %l6 = OpLabel
+        %w6 = OpFConvert %float %bf_1_5
+        %n6 = OpFConvert %bf16 %w6
+        %q6 = OpInBoundsPtrAccessChain %p_bf %p6 %ulong_16
+              OpStore %q6 %n6 Aligned 2
+        %x6 = OpFConvert %float %bf_inf
+        %y6 = OpFConvert %bf16 %x6
+        %r6 = OpInBoundsPtrAccessChain %p_bf %p6 %ulong_17
+              OpStore %r6 %y6 Aligned 2
+              OpReturn
+              OpFunctionEnd
+
+; The same as select_const, with the values moved as 16-bit integers.
+ %select_i16 = OpFunction %void None %fn
+        %p7 = OpFunctionParameter %p_bf
+        %l7 = OpLabel
+       %pa7 = OpBitcast %p_us %p7
+        %a7 = OpLoad %ushort %pa7 Aligned 2
+       %pf7 = OpInBoundsPtrAccessChain %p_bf %p7 %ulong_2
+       %pu7 = OpBitcast %p_us %pf7
+        %f7 = OpLoad %ushort %pu7 Aligned 2
+        %c7 = OpINotEqual %bool %f7 %ushort_0
+        %s7 = OpSelect %ushort %c7 %a7 %ushort_inf
+        %t7 = OpSelect %ushort %c7 %ushort_inf %a7
+        %q7 = OpInBoundsPtrAccessChain %p_bf %p7 %ulong_16
+       %qu7 = OpBitcast %p_us %q7
+              OpStore %qu7 %s7 Aligned 2
+        %r7 = OpInBoundsPtrAccessChain %p_bf %p7 %ulong_17
+       %ru7 = OpBitcast %p_us %r7
+              OpStore %ru7 %t7 Aligned 2
+              OpReturn
+              OpFunctionEnd
+
+; select_const with its results converted to float32 and back before the
+; stores, as promoted arithmetic does.
+%select_convert = OpFunction %void None %fn
+        %p8 = OpFunctionParameter %p_bf
+        %l8 = OpLabel
+        %a8 = OpLoad %bf16 %p8 Aligned 2
+       %pf8 = OpInBoundsPtrAccessChain %p_bf %p8 %ulong_2
+       %pu8 = OpBitcast %p_us %pf8
+        %f8 = OpLoad %ushort %pu8 Aligned 2
+        %c8 = OpINotEqual %bool %f8 %ushort_0
+        %s8 = OpSelect %bf16 %c8 %a8 %bf_inf
+        %t8 = OpSelect %bf16 %c8 %bf_inf %a8
+        %u8 = OpFConvert %float %s8
+        %v8 = OpFConvert %float %t8
+        %x8 = OpFConvert %bf16 %u8
+        %y8 = OpFConvert %bf16 %v8
+        %q8 = OpInBoundsPtrAccessChain %p_bf %p8 %ulong_16
+              OpStore %q8 %x8 Aligned 2
+        %r8 = OpInBoundsPtrAccessChain %p_bf %p8 %ulong_17
+              OpStore %r8 %y8 Aligned 2
+              OpReturn
+              OpFunctionEnd
+
+; The fix's shape: bfloat16 only between OpBitcast and OpFConvert. p[16] =
+; bits of +inf through an OpBitcast of the constant; p[17] = a, converted to
+; float32 and back between bitcasts from and to 16-bit integers.
+   %bitcasts = OpFunction %void None %fn
+        %p9 = OpFunctionParameter %p_bf
+        %l9 = OpLabel
+        %k9 = OpBitcast %ushort %bf_inf
+        %q9 = OpInBoundsPtrAccessChain %p_bf %p9 %ulong_16
+       %qu9 = OpBitcast %p_us %q9
+              OpStore %qu9 %k9 Aligned 2
+       %pa9 = OpBitcast %p_us %p9
+        %a9 = OpLoad %ushort %pa9 Aligned 2
+        %b9 = OpBitcast %bf16 %a9
+        %w9 = OpFConvert %float %b9
+        %n9 = OpFConvert %bf16 %w9
+        %i9 = OpBitcast %ushort %n9
+        %r9 = OpInBoundsPtrAccessChain %p_bf %p9 %ulong_17
+       %ru9 = OpBitcast %p_us %r9
+              OpStore %ru9 %i9 Aligned 2
+              OpReturn
+              OpFunctionEnd
+
+; a * 1.5 rounded to bfloat16, then that times 1.5 rounded again, all in one
+; block: p[16] = bits of a * 1.5 * 1.5 (0x4058 for a = 1.5), p[17] = bits of
+; a * 1.5 (0x4010).
+%round_twice = OpFunction %void None %fn
+       %p10 = OpFunctionParameter %p_bf
+       %l10 = OpLabel
+      %pa10 = OpBitcast %p_us %p10
+       %a10 = OpLoad %ushort %pa10 Aligned 2
+       %b10 = OpBitcast %bf16 %a10
+       %w10 = OpFConvert %float %b10
+       %m10 = OpFMul %float %w10 %float_1_5
+       %t10 = OpFConvert %bf16 %m10
+       %u10 = OpFConvert %float %t10
+       %v10 = OpFMul %float %u10 %float_1_5
+       %x10 = OpFConvert %bf16 %v10
+       %i10 = OpBitcast %ushort %x10
+       %j10 = OpBitcast %ushort %t10
+       %q10 = OpInBoundsPtrAccessChain %p_us %pa10 %ulong_16
+              OpStore %q10 %i10 Aligned 2
+       %r10 = OpInBoundsPtrAccessChain %p_us %pa10 %ulong_17
+              OpStore %r10 %j10 Aligned 2
+              OpReturn
+              OpFunctionEnd
+
+; The same with the second rounding in another block, taken when the flag is
+; set; p[16] = 0x7f80 otherwise.
+%round_across = OpFunction %void None %fn
+       %p11 = OpFunctionParameter %p_bf
+       %l11 = OpLabel
+      %pa11 = OpBitcast %p_us %p11
+       %a11 = OpLoad %ushort %pa11 Aligned 2
+       %b11 = OpBitcast %bf16 %a11
+       %w11 = OpFConvert %float %b11
+       %m11 = OpFMul %float %w11 %float_1_5
+       %t11 = OpFConvert %bf16 %m11
+       %j11 = OpBitcast %ushort %t11
+       %r11 = OpInBoundsPtrAccessChain %p_us %pa11 %ulong_17
+              OpStore %r11 %j11 Aligned 2
+      %pf11 = OpInBoundsPtrAccessChain %p_us %pa11 %ulong_2
+       %f11 = OpLoad %ushort %pf11 Aligned 2
+       %c11 = OpINotEqual %bool %f11 %ushort_0
+              OpBranchConditional %c11 %k11 %e11
+       %k11 = OpLabel
+       %u11 = OpFConvert %float %t11
+       %v11 = OpFMul %float %u11 %float_1_5
+       %x11 = OpFConvert %bf16 %v11
+       %i11 = OpBitcast %ushort %x11
+              OpBranch %e11
+       %e11 = OpLabel
+       %h11 = OpPhi %ushort %i11 %k11 %ushort_inf %l11
+       %q11 = OpInBoundsPtrAccessChain %p_us %pa11 %ulong_16
+              OpStore %q11 %h11 Aligned 2
+              OpReturn
+              OpFunctionEnd
+
+; round_twice without the store of the first rounding: p[16] = 0x4058.
+%round_once_used = OpFunction %void None %fn
+       %p12 = OpFunctionParameter %p_bf
+       %l12 = OpLabel
+      %pa12 = OpBitcast %p_us %p12
+       %a12 = OpLoad %ushort %pa12 Aligned 2
+       %b12 = OpBitcast %bf16 %a12
+       %w12 = OpFConvert %float %b12
+       %m12 = OpFMul %float %w12 %float_1_5
+       %t12 = OpFConvert %bf16 %m12
+       %u12 = OpFConvert %float %t12
+       %v12 = OpFMul %float %u12 %float_1_5
+       %x12 = OpFConvert %bf16 %v12
+       %i12 = OpBitcast %ushort %x12
+       %q12 = OpInBoundsPtrAccessChain %p_us %pa12 %ulong_16
+              OpStore %q12 %i12 Aligned 2
+              OpReturn
+              OpFunctionEnd
+
+; round_twice with the first rounding taken through a 16-bit integer: the
+; second conversion reads a bitcast of it.
+%round_via_int = OpFunction %void None %fn
+       %p13 = OpFunctionParameter %p_bf
+       %l13 = OpLabel
+      %pa13 = OpBitcast %p_us %p13
+       %a13 = OpLoad %ushort %pa13 Aligned 2
+       %b13 = OpBitcast %bf16 %a13
+       %w13 = OpFConvert %float %b13
+       %m13 = OpFMul %float %w13 %float_1_5
+       %t13 = OpFConvert %bf16 %m13
+       %j13 = OpBitcast %ushort %t13
+       %s13 = OpBitcast %bf16 %j13
+       %u13 = OpFConvert %float %s13
+       %v13 = OpFMul %float %u13 %float_1_5
+       %x13 = OpFConvert %bf16 %v13
+       %i13 = OpBitcast %ushort %x13
+       %q13 = OpInBoundsPtrAccessChain %p_us %pa13 %ulong_16
+              OpStore %q13 %i13 Aligned 2
+       %r13 = OpInBoundsPtrAccessChain %p_us %pa13 %ulong_17
+              OpStore %r13 %j13 Aligned 2
+              OpReturn
+              OpFunctionEnd

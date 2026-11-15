@@ -1,0 +1,49 @@
+diff --git a/IGC/Compiler/Legalizer/PeepholeTypeLegalizer.cpp b/IGC/Compiler/Legalizer/PeepholeTypeLegalizer.cpp
+index e77c37bcc..f891d3779 100644
+--- a/IGC/Compiler/Legalizer/PeepholeTypeLegalizer.cpp
++++ b/IGC/Compiler/Legalizer/PeepholeTypeLegalizer.cpp
+@@ -1626,6 +1626,29 @@ void PeepholeTypeLegalizer::cleanupBitCastInst(Instruction &I) {
+ 
+     break;
+   }
++  case Instruction::Load: {
++    // An illegal integer load (an i128 operand legalized above, whose users
++    // now bitcast it to a vector of legal integers): load that vector
++    // instead, at the same place, so no illegal type is left.
++    auto *LI = cast<LoadInst>(prevInst);
++    Type *dstType = I.getType();
++    if (isLegalInteger(LI->getType()->getScalarSizeInBits()))
++      break;
++    if (!LI->getType()->isIntegerTy() || !LI->isSimple() ||
++        DL->getTypeStoreSize(LI->getType()) != DL->getTypeStoreSize(dstType)) {
++      IGC_ASSERT_MESSAGE(0, "Unexpected illegal type width");
++      break;
++    }
++    m_builder->SetInsertPoint(LI);
++    LoadInst *newLoad = m_builder->CreateAlignedLoad(dstType, LI->getPointerOperand(), LI->getAlign());
++    newLoad->setDebugLoc(LI->getDebugLoc());
++    I.replaceAllUsesWith(newLoad);
++    I.eraseFromParent();
++    if (LI->use_empty())
++      LI->eraseFromParent();
++    Changed = true;
++    break;
++  }
+   default:
+     IGC_ASSERT_MESSAGE(isLegalInteger(I.getOperand(0)->getType()->getScalarSizeInBits()),
+                        "Unexpected illegal type width");
+diff --git a/IGC/Compiler/Optimizer/OpenCLPasses/ProgramScopeConstants/ProgramScopeConstantAnalysis.cpp b/IGC/Compiler/Optimizer/OpenCLPasses/ProgramScopeConstants/ProgramScopeConstantAnalysis.cpp
+index feccc6646..c4b4db615 100644
+--- a/IGC/Compiler/Optimizer/OpenCLPasses/ProgramScopeConstants/ProgramScopeConstantAnalysis.cpp
++++ b/IGC/Compiler/Optimizer/OpenCLPasses/ProgramScopeConstants/ProgramScopeConstantAnalysis.cpp
+@@ -477,8 +477,9 @@ void ProgramScopeConstantAnalysis::addData(Constant *initializer,
+ 
+     const int bitWidth = intVal.getBitWidth();
+     IGC_ASSERT_MESSAGE((bitWidth % 8 == 0), "Unsupported bitwidth");
+-    IGC_ASSERT_MESSAGE((bitWidth <= 64), "Unsupported bitwidth");
+ 
++    // getRawData() holds all bitWidth / 8 bytes, low word first, also for
++    // integers wider than 64 bits (i128 tables).
+     const uint64_t *const val = intVal.getRawData();
+     inlineProgramScopeBuffer.insert(inlineProgramScopeBuffer.end(), (char *)val, ((char *)val) + (bitWidth / 8));
+   }

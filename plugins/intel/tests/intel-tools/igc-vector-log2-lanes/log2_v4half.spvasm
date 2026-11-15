@@ -1,0 +1,72 @@
+; ===----------------------------------------------------------------------=== ;
+; Copyright (c) 2026, Sean Avery. All rights reserved.
+;
+; Licensed under the Apache License v2.0 with LLVM Exceptions:
+; https://llvm.org/LICENSE.txt
+;
+; Unless required by applicable law or agreed to in writing, software
+; distributed under the License is distributed on an "AS IS" BASIS,
+; WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+; See the License for the specific language governing permissions and
+; limitations under the License.
+; ===----------------------------------------------------------------------=== ;
+
+; float16 log2 at width 4. Mojo's `log2` on SIMD[float16, 4] widens to
+; float, calls OpenCL log2 and narrows back; p[64..67] = log2(p[0..3]),
+; p[128..131] = exp2(p[0..3]) (halves). Emitted by LLVM's SPIR-V backend through
+; the Mojo Intel compiler plugin; only the entry point is renamed. With IGC's
+; default optimization log2 returns x for x >= 1 and 0 below; with
+; -cl-opt-disable it is right, and exp2 on the same path is right either way.
+; SPIR-V
+; Version: 1.4
+; Generator: LLVM LLVM SPIR-V Backend; 24
+; Bound: 63
+; Schema: 0
+               OpCapability Kernel
+               OpCapability Addresses
+               OpCapability Int8
+               OpCapability GenericPointer
+               OpCapability Int64
+               OpCapability Float16
+               OpCapability SubgroupDispatch
+          %1 = OpExtInstImport "OpenCL.std"
+               OpMemoryModel Physical64 OpenCL
+               OpEntryPoint Kernel %16 "log2_v4half"
+               OpExecutionMode %16 SubgroupSize 16
+               OpExecutionMode %16 ContractionOff
+               OpSource OpenCL_CPP 100000
+               OpName %16 "log2_v4half"
+               OpDecorate %15 FuncParamAttr NoCapture
+       %half = OpTypeFloat 16
+     %v4half = OpTypeVector %half 4
+%_ptr_CrossWorkgroup_v4half = OpTypePointer CrossWorkgroup %v4half
+       %void = OpTypeVoid
+          %6 = OpTypeFunction %void %_ptr_CrossWorkgroup_v4half
+      %uchar = OpTypeInt 8 0
+%_ptr_Generic_uchar = OpTypePointer Generic %uchar
+%_ptr_Generic_v4half = OpTypePointer Generic %v4half
+      %float = OpTypeFloat 32
+    %v4float = OpTypeVector %float 4
+      %ulong = OpTypeInt 64 0
+  %ulong_256 = OpConstant %ulong 256
+  %ulong_128 = OpConstant %ulong 128
+         %16 = OpFunction %void None %6
+         %15 = OpFunctionParameter %_ptr_CrossWorkgroup_v4half
+         %30 = OpLabel
+         %17 = OpPtrCastToGeneric %_ptr_Generic_v4half %15
+         %18 = OpBitcast %_ptr_Generic_uchar %17
+         %19 = OpBitcast %_ptr_Generic_uchar %17
+         %20 = OpLoad %v4half %17 Aligned 2
+         %21 = OpFConvert %v4float %20
+         %22 = OpExtInst %v4float %1 log2 %21
+         %23 = OpFConvert %v4half %22
+         %24 = OpInBoundsPtrAccessChain %_ptr_Generic_uchar %18 %ulong_128
+         %25 = OpBitcast %_ptr_Generic_v4half %24
+               OpStore %25 %23 Aligned 2
+         %26 = OpExtInst %v4float %1 exp2 %21
+         %27 = OpFConvert %v4half %26
+         %28 = OpInBoundsPtrAccessChain %_ptr_Generic_uchar %19 %ulong_256
+         %29 = OpBitcast %_ptr_Generic_v4half %28
+               OpStore %29 %27 Aligned 2
+               OpReturn
+               OpFunctionEnd

@@ -1,0 +1,21 @@
+diff --git a/IGC/Compiler/CISACodeGen/EmitVISAPass.cpp b/IGC/Compiler/CISACodeGen/EmitVISAPass.cpp
+index 578975bf1..b71c75183 100644
+--- a/IGC/Compiler/CISACodeGen/EmitVISAPass.cpp
++++ b/IGC/Compiler/CISACodeGen/EmitVISAPass.cpp
+@@ -4917,8 +4917,14 @@ void EmitPass::FPTrunc(const SSource sources[2], const DstModifier &modifier) {
+       } else
+         m_encoder->SetSrcSubVar(0, i);
+       m_encoder->SetDstModifier(modifier);
+-      m_encoder->SetDstSubVar(row);
+-      m_encoder->SetDstSubReg(col);
++      if (m_destination->IsUniform()) {
++        // A uniform result holds one element per lane of the vector, packed:
++        // element i is at sub-register i, not in a per-lane row.
++        m_encoder->SetDstSubReg(i);
++      } else {
++        m_encoder->SetDstSubVar(row);
++        m_encoder->SetDstSubReg(col);
++      }
+       m_encoder->Cast(m_destination, src[0]);
+       m_encoder->Push();
+     }
