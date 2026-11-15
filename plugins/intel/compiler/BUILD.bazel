@@ -28,6 +28,7 @@ modular_cc_library(
         "Convergent.cpp",
         "DynamicSharedMemory.cpp",
         "Heap.cpp",
+        "MaskBitcasts.cpp",
         "NestedStructArguments.cpp",
         "PromoteBFloat16.cpp",
         "RemapAddressSpaces.cpp",
@@ -42,6 +43,7 @@ modular_cc_library(
         "Convergent.h",
         "DynamicSharedMemory.h",
         "Heap.h",
+        "MaskBitcasts.h",
         "NestedStructArguments.h",
         "PromoteBFloat16.h",
         "RemapAddressSpaces.h",
@@ -189,6 +191,18 @@ modular_cc_test(
     deps = [
         ":IntelPasses",
         "@llvm-project//llvm:Analysis",
+        "@llvm-project//llvm:AsmParser",
+        "@llvm-project//llvm:Core",
+        "@llvm-project//llvm:Support",
+    ],
+)
+
+modular_cc_test(
+    name = "MaskBitcastsTest",
+    size = "small",
+    srcs = ["test/MaskBitcastsTest.cpp"],
+    deps = [
+        ":IntelPasses",
         "@llvm-project//llvm:AsmParser",
         "@llvm-project//llvm:Core",
         "@llvm-project//llvm:Support",
