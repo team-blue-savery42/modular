@@ -19,6 +19,7 @@
 
 #include "MLRT/Driver/DeviceContext/HALDeviceContext.h"
 
+#include "AsyncRT/Runtime/Algorithms.h"
 #include "AsyncRT/Runtime/CPUDevice.h"
 #include "HAL/M_driver_context.h"
 #include "MLRT/Driver/DeviceContext/BinaryID.h"
@@ -33,10 +34,13 @@
 #include "llvm/Support/ErrorHandling.h"
 
 #include <atomic>
+#include <cstdio>
+#include <dlfcn.h>
 #include <functional>
 #include <initializer_list>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <shared_mutex>
 #include <string>
 #include <utility>
@@ -140,6 +144,10 @@ const char *MojoHAL_DeviceStream_waitForEvent(MojoHALStreamBox *stream,
                                               MojoHALEventBox *event);
 const char *MojoHAL_DeviceStream_nativeHandle(void **out_handle,
                                               MojoHALStreamBox *stream);
+const char *MojoHAL_DeviceStream_pluginQueue(void **out_queue,
+                                             void **out_driver,
+                                             const char **out_plugin_path,
+                                             MojoHALStreamBox *stream);
 const char *MojoHAL_DeviceContext_eventCreate(MojoHALEventBox **out_event,
                                               MojoHALContextBox *ctx,
                                               bool record);
@@ -1294,22 +1302,133 @@ bool DeviceContext::supportsCompletionFlags() const {
 // ===-- Device graphs (unsupported) --------------------------------------===
 // //
 
-// Capture always fails, so no DeviceGraph instance ever exists and the replay
-// entry points below are unreachable; they are defined only to close the link.
+// Device graphs through a plugin's graph entry points outside the HAL C API
+// (today only the Level Zero plugin's IntelGraphs.h). A plugin that doesn't
+// export them gets the unsupported-feature error.
 
 static constexpr const char *kNoDeviceGraphs =
     "device graphs are not supported with the HAL DeviceContext backend";
+
+namespace {
+
+/// The graph entry points of one stream's plugin, resolved by name.
+struct PluginGraphs {
+  void *queue = nullptr;
+  void *driver = nullptr;
+  int64_t (*begin)(void *) = nullptr;
+  int64_t (*end)(void *, void **) = nullptr;
+  int64_t (*launch)(void *, void *) = nullptr;
+  int64_t (*destroy)(void *) = nullptr;
+  M_driver_status_t (*message)(void *, M_driver_status_t, char *,
+                               int64_t) = nullptr;
+
+  Error error(StringRef what, M_driver_status_t status) const {
+    char buf[1024] = {};
+    if (message == nullptr || message(driver, status, buf, sizeof(buf)) != 0)
+      std::snprintf(buf, sizeof(buf), "status %lld", (long long)status);
+    return Error(Twine(what) + ": " + buf);
+  }
+};
+
+/// Null when the stream's plugin has no graph entry points.
+ErrorOr<std::optional<PluginGraphs>> pluginGraphsFor(MojoHALStreamBox *box) {
+  PluginGraphs fns;
+  const char *path = nullptr;
+  if (const char *err =
+          MojoHAL_DeviceStream_pluginQueue(&fns.queue, &fns.driver, &path, box))
+    return takeError(err);
+  // The plugin is loaded already; RTLD_NOLOAD finds it without loading.
+  void *lib = dlopen(path, RTLD_NOW | RTLD_NOLOAD);
+  MojoHAL_strfree(path);
+  if (lib == nullptr)
+    return std::optional<PluginGraphs>();
+  auto sym = [&](const char *name) { return dlsym(lib, name); };
+  fns.begin = reinterpret_cast<decltype(fns.begin)>(
+      sym("M_driver_intel_graph_capture_begin"));
+  fns.end = reinterpret_cast<decltype(fns.end)>(
+      sym("M_driver_intel_graph_capture_end"));
+  fns.launch = reinterpret_cast<decltype(fns.launch)>(
+      sym("M_driver_intel_graph_launch"));
+  fns.destroy = reinterpret_cast<decltype(fns.destroy)>(
+      sym("M_driver_intel_graph_destroy"));
+  fns.message =
+      reinterpret_cast<decltype(fns.message)>(sym("M_driver_status_message"));
+  // The handle only finds the symbols; the HAL keeps the plugin loaded.
+  dlclose(lib);
+  if (fns.begin == nullptr || fns.end == nullptr || fns.launch == nullptr ||
+      fns.destroy == nullptr)
+    return std::optional<PluginGraphs>();
+  return std::optional<PluginGraphs>(fns);
+}
+
+} // namespace
+
+DeviceGraph::~DeviceGraph() {
+  if (pluginGraph_ != nullptr && destroy_ != nullptr)
+    (void)destroy_(pluginGraph_);
+}
 
 ErrorOr<DeviceGraphCollection>
 DeviceGraph::capture(M::AsyncRT::CPUDevice &cpuDevice,
                      llvm::ArrayRef<DeviceStreamRef> streams,
                      llvm::function_ref<ErrorOrSuccess()> execute) {
-  return Error(kNoDeviceGraphs);
+  llvm::SmallVector<PluginGraphs, 2> fns;
+  for (const DeviceStreamRef &stream : streams) {
+    ErrorOr<std::optional<PluginGraphs>> found =
+        pluginGraphsFor(stream->mojoStream_);
+    if (found.isError())
+      return found.takeError();
+    if (!found->has_value())
+      return Error(kNoDeviceGraphs);
+    fns.push_back(**found);
+  }
+  size_t begun = 0;
+  ErrorOrSuccess status = success();
+  for (; begun < fns.size(); ++begun)
+    if (M_driver_status_t s = fns[begun].begin(fns[begun].queue)) {
+      status = fns[begun].error("device graph capture_begin", s);
+      break;
+    }
+  if (!status.isError())
+    status = execute();
+  // Every queue that began capturing ends it, so none stays in capture mode.
+  llvm::SmallVector<void *, 2> graphs(begun, nullptr);
+  for (size_t i = 0; i < begun; ++i)
+    if (M_driver_status_t s = fns[i].end(fns[i].queue, &graphs[i]))
+      if (!status.isError())
+        status = fns[i].error("device graph capture_end", s);
+  if (status.isError()) {
+    for (size_t i = 0; i < begun; ++i)
+      if (graphs[i] != nullptr)
+        (void)fns[i].destroy(graphs[i]);
+    return status.takeError();
+  }
+  llvm::SmallVector<AsyncDeviceGraphRef> asyncGraphs;
+  for (size_t i = 0; i < fns.size(); ++i) {
+    AsyncDeviceGraphRef graph = AsyncDeviceGraphRef::allocate(cpuDevice);
+    std::move(graph.copy())
+        .emplace(DeviceGraphRef::create(streams[i].copy(), graphs[i],
+                                        fns[i].destroy, fns[i].launch,
+                                        fns[i].queue));
+    asyncGraphs.push_back(std::move(graph));
+  }
+  return DeviceGraphCollection(std::move(asyncGraphs));
 }
 
-ErrorOrSuccess DeviceGraph::replay() const { return Error(kNoDeviceGraphs); }
+ErrorOrSuccess DeviceGraph::replay() const {
+  if (pluginGraph_ == nullptr || launch_ == nullptr)
+    return Error(kNoDeviceGraphs);
+  if (M_driver_status_t s = launch_(pluginQueue_, pluginGraph_))
+    return Error(Twine("device graph launch failed with status ") +
+                 Twine(static_cast<int64_t>(s)));
+  return success();
+}
 
 ErrorOrSuccess DeviceGraph::patchStableAddresses() const {
+  // Stream-captured graphs have no stable assignments (they come from
+  // DeviceGraphBuilder, which the HAL backend doesn't have).
+  if (stableAssignments_.empty())
+    return success();
   return Error(kNoDeviceGraphs);
 }
 
@@ -1318,7 +1437,13 @@ DeviceContext &DeviceGraph::context() const {
 }
 
 ErrorOrSuccess DeviceGraphCollection::replay() const {
-  return Error(kNoDeviceGraphs);
+  for (const AsyncDeviceGraphRef &graph : graphs) {
+    if (auto err = AsyncRT::awaitOrError(graph))
+      return err.takeError();
+    if (auto err = (*graph)->replay())
+      return err;
+  }
+  return success();
 }
 
 ErrorOrSuccess DeviceGraphCollection::debugVerifyReplay(

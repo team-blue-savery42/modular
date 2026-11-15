@@ -820,6 +820,31 @@ def MojoHAL_DeviceStream_synchronize(
 
 
 @export
+def MojoHAL_DeviceStream_pluginQueue(
+    out_queue: _OutPtr[_RawMemoryPtr],
+    out_driver: _OutPtr[_RawMemoryPtr],
+    out_plugin_path: _OutPtr[_CString[]],
+    stream: _DeviceStreamBoxPtr,
+) abi("C") -> _CString[]:
+    """The stream's HAL plugin queue (`M_driver_queue_t`), its driver
+    (`M_driver_driver_t`) and the plugin's path (freed with
+    `MojoHAL_strfree`), for a plugin's entry points outside the HAL C API
+    that the C++ shim resolves itself (the Intel device graph entry points;
+    a plugin without them is unaffected)."""
+    try:
+        ref queue = stream[]._hal_stream()[]._queue[]
+        out_queue[] = _RawMemoryPtr(unsafe_from_address=Int(queue._handle))
+        ref raw = queue._raw[]
+        out_driver[] = _RawMemoryPtr(
+            unsafe_from_address=Int(raw._driver_handle)
+        )
+        out_plugin_path[] = _err_cstr(raw._raw.so_path)
+        return None
+    except e:
+        return _err_cstr(String(e))
+
+
+@export
 def MojoHAL_DeviceStream_waitForEvent(
     stream: _DeviceStreamBoxPtr,
     event: _DeviceEventBoxPtr,
