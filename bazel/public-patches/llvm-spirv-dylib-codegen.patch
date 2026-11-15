@@ -1,0 +1,45 @@
+--- a/utils/bazel/llvm-project-overlay/llvm/BUILD.bazel
++++ b/utils/bazel/llvm-project-overlay/llvm/BUILD.bazel
+@@ -4772,7 +4772,12 @@
+             "Info",
+             "UtilsAndDesc",
+         ]
+-    ],
++    ] + (
++        # SPIRVTranslateModule (SPIRVAPI.cpp), which MLIR's XeVM target
++        # calls, is reached by nothing else in libLLVM, so the SPIR-V code
++        # generator is listed directly to be whole-archived.
++        [":SPIRVCodeGen"] if "SPIRV" in llvm_targets else []
++    ),
+ )
+ 
+ cc_library(
+--- a/llvm/lib/Target/SPIRV/SPIRVAPI.cpp
++++ b/llvm/lib/Target/SPIRV/SPIRVAPI.cpp
+@@ -120,7 +120,7 @@
+ 
+ // TODO: Remove this wrapper after existing clients switch into a newer
+ // implementation of SPIRVTranslate().
+-extern "C" LLVM_EXTERNAL_VISIBILITY bool
++extern "C" LLVM_ABI LLVM_EXTERNAL_VISIBILITY bool
+ SPIRVTranslateModule(Module *M, std::string &SpirvObj, std::string &ErrMsg,
+                      const std::vector<std::string> &AllowExtNames,
+                      const std::vector<std::string> &Opts) {
+--- a/llvm/lib/Target/SPIRV/SPIRVAPI.h
++++ b/llvm/lib/Target/SPIRV/SPIRVAPI.h
+@@ -9,13 +9,14 @@
+ #ifndef LLVM_LIB_TARGET_SPIRV_SPIRVAPI_H
+ #define LLVM_LIB_TARGET_SPIRV_SPIRVAPI_H
+ 
++#include "llvm/Support/Compiler.h"
+ #include <string>
+ #include <vector>
+ 
+ namespace llvm {
+ class Module;
+ 
+-extern "C" bool
++extern "C" LLVM_ABI bool
+ SPIRVTranslateModule(Module *M, std::string &SpirvObj, std::string &ErrMsg,
+                      const std::vector<std::string> &AllowExtNames,
+                      const std::vector<std::string> &Opts);

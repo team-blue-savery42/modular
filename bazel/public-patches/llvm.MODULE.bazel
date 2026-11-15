@@ -22,6 +22,11 @@ llvm_source.configure(
         # be bridged, so wholesale AGPR reclassification would be illegal.
         # Tracking: MOCO-4155.
         "//bazel/public-patches:llvm-mfma-allow-non-mai-users.patch",
+        # libLLVM (llvm-shared.patch) whole-archives only its direct deps, and
+        # nothing in it calls SPIRVTranslateModule, which also lacked LLVM_ABI
+        # (hidden in libLLVM); so with the SPIR-V target
+        # on, libMLIR.so (MLIR's XeVM target) failed to link. Intel only.
+        "//bazel/public-patches:llvm-spirv-dylib-codegen.patch",
     ],
 )
 
@@ -34,5 +39,6 @@ llvm_configure.configure(
         "AMDGPU",
         "Hexagon",
         "NVPTX",
+        "SPIRV",
     ],
 )
