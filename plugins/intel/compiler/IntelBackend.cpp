@@ -26,6 +26,7 @@
 #include "Convergent.h"
 #include "DynamicSharedMemory.h"
 #include "Heap.h"
+#include "Int128.h"
 #include "IntelAddressSpace.h"
 #include "IntelTraits.h"
 #include "MaskBitcasts.h"
@@ -217,6 +218,10 @@ protected:
     defineHeapFunctions(module);
     dropUnusedAbortFlag(module);
     returnAfterAbort(module);
+    // After every pass that adds instructions: IGC computes 128-bit integers
+    // wrongly, so none may reach it.
+    if (llvm::Expected<bool> lowered = lowerInt128(module); !lowered)
+      return lowered.takeError();
     return addDynamicSharedMemoryParameter(module);
   }
 

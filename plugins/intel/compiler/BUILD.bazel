@@ -28,6 +28,7 @@ modular_cc_library(
         "Convergent.cpp",
         "DynamicSharedMemory.cpp",
         "Heap.cpp",
+        "Int128.cpp",
         "MaskBitcasts.cpp",
         "NestedStructArguments.cpp",
         "PromoteBFloat16.cpp",
@@ -43,6 +44,7 @@ modular_cc_library(
         "Convergent.h",
         "DynamicSharedMemory.h",
         "Heap.h",
+        "Int128.h",
         "MaskBitcasts.h",
         "NestedStructArguments.h",
         "PromoteBFloat16.h",
@@ -176,6 +178,18 @@ modular_cc_test(
     name = "HeapTest",
     size = "small",
     srcs = ["test/HeapTest.cpp"],
+    deps = [
+        ":IntelPasses",
+        "@llvm-project//llvm:AsmParser",
+        "@llvm-project//llvm:Core",
+        "@llvm-project//llvm:Support",
+    ],
+)
+
+modular_cc_test(
+    name = "Int128Test",
+    size = "small",
+    srcs = ["test/Int128Test.cpp"],
     deps = [
         ":IntelPasses",
         "@llvm-project//llvm:AsmParser",
