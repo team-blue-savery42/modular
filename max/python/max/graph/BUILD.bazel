@@ -3,9 +3,19 @@ load("//bazel:api.bzl", "modular_py_library", "requirement")
 
 package(default_visibility = ["//max:consumers"])
 
+# Tells Python code which driver build it runs in (see buffer_utils.py).
+genrule(
+    name = "build_config",
+    outs = ["_build_config.py"],
+    cmd = select({
+        "//:hal_device_context_enabled": "echo 'HAL_DEVICE_CONTEXT = True' > $@",
+        "//conditions:default": "echo 'HAL_DEVICE_CONTEXT = False' > $@",
+    }),
+)
+
 modular_py_library(
     name = "graph",
-    srcs = glob(["**/*.py"]),
+    srcs = glob(["**/*.py"]) + [":build_config"],
     # The graph compiler's built-in kernel registrations. Every consumer of
     # `max.graph` reaches them through here, so this is also where a build that
     # has closed-source kernel packages picks those up.
