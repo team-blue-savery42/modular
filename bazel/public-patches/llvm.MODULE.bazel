@@ -37,6 +37,14 @@ llvm_source.configure(
         # out; spirv-val requires them declared. Declare them explicitly,
         # which IGC accepts too. Not yet reported upstream.
         "//bazel/public-patches:llvm-spirv-arbitrary-precision-explicit-int8.patch",
+        # CodeGenPrepare can sink an address into a function as a constant GEP
+        # on an addrspacecast of a global. The SPIR-V instruction selector
+        # assumed constant GEPs are on global variables only: with assertions
+        # it asserts; without them, when the cast's pointee type matches the
+        # GEP's, it builds invalid SPIR-V (an OpSpecConstantOp on an ID it
+        # defines after it, which spirv-val rejects). Build an access chain in
+        # the function instead. Not yet reported upstream.
+        "//bazel/public-patches:llvm-spirv-ptr-add-on-cast.patch",
         # libLLVM (llvm-shared.patch) whole-archives only its direct deps, and
         # nothing in it calls SPIRVTranslateModule, which also lacked LLVM_ABI
         # (hidden in libLLVM); so with the SPIR-V target

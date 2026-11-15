@@ -1,0 +1,161 @@
+diff --git a/llvm/lib/Target/SPIRV/SPIRVInstructionSelector.cpp b/llvm/lib/Target/SPIRV/SPIRVInstructionSelector.cpp
+--- a/llvm/lib/Target/SPIRV/SPIRVInstructionSelector.cpp
++++ b/llvm/lib/Target/SPIRV/SPIRVInstructionSelector.cpp
+@@ -197,6 +197,8 @@
+ 
+   bool selectPtrMask(Register ResVReg, SPIRVTypeInst ResType,
+                      MachineInstr &I) const;
++  bool selectPtrAddOnValue(Register ResVReg, SPIRVTypeInst ResType,
++                           MachineInstr &I) const;
+ 
+   bool selectAnyOrAll(Register ResVReg, SPIRVTypeInst ResType, MachineInstr &I,
+                       unsigned OpType) const;
+@@ -1286,18 +1288,18 @@
+   case TargetOpcode::G_PTRMASK:
+     return selectPtrMask(ResVReg, ResType, I);
+   case TargetOpcode::G_PTR_ADD: {
+-    // Currently, we get G_PTR_ADD only applied to global variables, possibly
+-    // through an address space cast.
++    // We get G_PTR_ADD from constant GEP expressions, mostly on global
++    // variables, possibly through an address space cast.
+     assert(I.getOperand(1).isReg() && I.getOperand(2).isReg());
+     Register GV = I.getOperand(1).getReg();
+     MachineRegisterInfo::def_instr_iterator II = MRI->def_instr_begin(GV);
+     const bool IsAddrSpaceCast =
+         (*II).getOpcode() == TargetOpcode::G_ADDRSPACE_CAST;
+-    assert(((*II).getOpcode() == TargetOpcode::G_GLOBAL_VALUE ||
+-            (*II).getOpcode() == TargetOpcode::COPY || IsAddrSpaceCast ||
+-            (*II).getOpcode() == SPIRV::OpVariable ||
+-            (*II).getOpcode() == SPIRV::OpUntypedVariableKHR) &&
+-           getImm(I.getOperand(2), MRI));
++    const bool BaseIsVariable =
++        (*II).getOpcode() == TargetOpcode::G_GLOBAL_VALUE ||
++        (*II).getOpcode() == TargetOpcode::COPY ||
++        (*II).getOpcode() == SPIRV::OpVariable ||
++        (*II).getOpcode() == SPIRV::OpUntypedVariableKHR;
+     // It may be the initialization of a global variable.
+     bool IsGVInit = false;
+     for (MachineRegisterInfo::use_instr_iterator
+@@ -1312,6 +1314,17 @@
+         break;
+       }
+     }
++    // CodeGenPrepare can also sink an address into a function as a constant
++    // GEP on a cast of a global, such as
++    //   getelementptr (i8, ptr addrspace(4) addrspacecast (ptr addrspace(3)
++    //                  @g to ptr addrspace(4)), i64 24)
++    // whose base is selected as an instruction, not a constant. An
++    // OpSpecConstantOp can't use it: build an access chain in the function.
++    if (SPIRVTypeInst BaseType = GR.getSPIRVTypeForVReg(GV);
++        !BaseIsVariable && !IsGVInit && BaseType && BaseType.isPointer())
++      return selectPtrAddOnValue(ResVReg, ResType, I);
++    assert((BaseIsVariable || IsAddrSpaceCast) &&
++           getImm(I.getOperand(2), MRI));
+     // An address space cast of null can be typed as an integer, but the base of
+     // an access chain must be a pointer. Other integer-typed casts cannot be
+     // represented by replacing their base with a pointer constant.
+@@ -3113,6 +3126,69 @@
+ 
+   // Bitcast for pointers requires that the address spaces must match
+   return false;
++}
++
++// G_PTR_ADD on a pointer that is not a global variable, in a function. Its
++// offset counts bytes, so index an i8 pointer in the result's storage class
++// and cast the result back if it points to another type.
++bool SPIRVInstructionSelector::selectPtrAddOnValue(Register ResVReg,
++                                                   SPIRVTypeInst ResType,
++                                                   MachineInstr &I) const {
++  MachineBasicBlock &BB = *I.getParent();
++  const DebugLoc &DL = I.getDebugLoc();
++  Register Base = I.getOperand(1).getReg();
++  Register Offset = I.getOperand(2).getReg();
++  const bool InBounds = I.getFlag(MachineInstr::InBounds);
++  if (STI.isLogicalSPIRV())
++    return diagnoseUnsupported(
++        I, "pointer arithmetic on a pointer that is not a variable");
++  SPIRVTypeInst ByteType = GR.getOrCreateSPIRVIntegerType(8, I, TII);
++  if (ResType->getOpcode() == SPIRV::OpTypeUntypedPointerKHR) {
++    BuildMI(BB, I, DL,
++            TII.get(InBounds ? SPIRV::OpUntypedInBoundsPtrAccessChainKHR
++                             : SPIRV::OpUntypedPtrAccessChainKHR))
++        .addDef(ResVReg)
++        .addUse(GR.getSPIRVTypeID(ResType))
++        .addUse(GR.getSPIRVTypeID(ByteType))
++        .addUse(Base)
++        .addUse(Offset)
++        .constrainAllUses(TII, TRI, RBI);
++    return true;
++  }
++  SPIRVTypeInst BytePtrType = GR.getOrCreateSPIRVPointerType(
++      Type::getInt8Ty(I.getMF()->getFunction().getContext()), I,
++      GR.getPointerStorageClass(ResType));
++  SPIRVTypeInst BaseType = GR.getSPIRVTypeForVReg(Base);
++  if (!BaseType || BaseType != BytePtrType) {
++    if (BaseType && !GR.isBitcastCompatible(BytePtrType, BaseType))
++      return diagnoseUnsupported(
++          I, "incompatible result and operand types in a bitcast");
++    Register BytePtr = createVirtualRegister(BytePtrType, &GR, MRI, *I.getMF());
++    BuildMI(BB, I, DL, TII.get(SPIRV::OpBitcast))
++        .addDef(BytePtr)
++        .addUse(GR.getSPIRVTypeID(BytePtrType))
++        .addUse(Base)
++        .constrainAllUses(TII, TRI, RBI);
++    Base = BytePtr;
++  }
++  const unsigned Opcode =
++      InBounds ? SPIRV::OpInBoundsPtrAccessChain : SPIRV::OpPtrAccessChain;
++  Register Chain = ResVReg;
++  if (ResType != BytePtrType)
++    Chain = createVirtualRegister(BytePtrType, &GR, MRI, *I.getMF());
++  BuildMI(BB, I, DL, TII.get(Opcode))
++      .addDef(Chain)
++      .addUse(GR.getSPIRVTypeID(BytePtrType))
++      .addUse(Base)
++      .addUse(Offset)
++      .constrainAllUses(TII, TRI, RBI);
++  if (Chain != ResVReg)
++    BuildMI(BB, I, DL, TII.get(SPIRV::OpBitcast))
++        .addDef(ResVReg)
++        .addUse(GR.getSPIRVTypeID(ResType))
++        .addUse(Chain)
++        .constrainAllUses(TII, TRI, RBI);
++  return true;
+ }
+ 
+ // G_PTRMASK - Apply a bitmask to a pointer value.
+diff --git a/llvm/test/CodeGen/SPIRV/pointers/ptr-add-sunk-addrspacecast.ll b/llvm/test/CodeGen/SPIRV/pointers/ptr-add-sunk-addrspacecast.ll
+new file mode 100644
+--- /dev/null
++++ b/llvm/test/CodeGen/SPIRV/pointers/ptr-add-sunk-addrspacecast.ll
+@@ -0,0 +1,30 @@
++; CodeGenPrepare sinks the address of %v into block %b as the constant
++; getelementptr (i8, ptr addrspace(4) addrspacecast (ptr addrspace(3) @g to
++; ptr addrspace(4)), i64 24), which reaches instruction selection as a
++; G_PTR_ADD on a G_ADDRSPACE_CAST rather than on a global variable.
++
++; RUN: llc -verify-machineinstrs -mtriple=spirv64-unknown-unknown %s -o - | FileCheck %s
++; RUN: %if spirv-tools %{ llc -mtriple=spirv64-unknown-unknown %s -o - -filetype=obj | spirv-val %}
++
++; CHECK-DAG: %[[#Char:]] = OpTypeInt 8 0
++; CHECK-DAG: %[[#Float:]] = OpTypeFloat 32
++; CHECK-DAG: %[[#GenCharPtr:]] = OpTypePointer Generic %[[#Char]]
++; CHECK-DAG: %[[#GenFloatPtr:]] = OpTypePointer Generic %[[#Float]]
++; CHECK-DAG: %[[#Long:]] = OpTypeInt 64 0
++; CHECK-DAG: %[[#C24:]] = OpConstant %[[#Long]] 24
++; CHECK-DAG: %[[#G:]] = OpVariable %[[#]] Workgroup
++; CHECK: %[[#Cast:]] = OpPtrCastToGeneric %[[#]] %[[#G]]
++; CHECK: %[[#Bytes:]] = OpBitcast %[[#GenCharPtr]] %[[#Cast]]
++; CHECK: %[[#Addr:]] = OpPtrAccessChain %[[#GenCharPtr]] %[[#Bytes]] %[[#C24]]
++; CHECK: %[[#Ptr:]] = OpBitcast %[[#GenFloatPtr]] %[[#Addr]]
++; CHECK: OpLoad %[[#Float]] %[[#Ptr]]
++
++@g = external addrspace(3) global [8 x float]
++
++define spir_kernel void @k(ptr addrspace(1) %out) {
++  br label %b
++b:
++  %v = load float, ptr addrspace(4) inttoptr (i64 add (i64 ptrtoint (ptr addrspace(3) @g to i64), i64 24) to ptr addrspace(4)), align 4
++  store float %v, ptr addrspace(1) %out, align 4
++  ret void
++}
