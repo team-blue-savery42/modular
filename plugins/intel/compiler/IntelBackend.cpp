@@ -33,6 +33,7 @@
 #include "RemapAddressSpaces.h"
 #include "SPIRVBinary.h"
 #include "SubgroupSize.h"
+#include "ZeroLengthArrays.h"
 
 #include "Mojo/ToolCommon/CompilationOptions.h"
 #include "Target/Host/HostBackend.h"
@@ -192,6 +193,10 @@ public:
 protected:
   /// The rewrites that must see the optimized module, just before llc.
   static llvm::Error prepareForCodegen(llvm::Module &module) {
+    // First: it turns extractvalues of the arguments into loads.
+    if (llvm::Expected<bool> rewritten = rewriteArrayParameters(module);
+        !rewritten)
+      return rewritten.takeError();
     flattenNestedStructArguments(module);
     promoteBFloat16(module);
     expandStepVectors(module);

@@ -33,6 +33,7 @@ modular_cc_library(
         "RemapAddressSpaces.cpp",
         "SPIRVBinary.cpp",
         "SubgroupSize.cpp",
+        "ZeroLengthArrays.cpp",
     ],
     hdrs = [
         "Abort.h",
@@ -45,6 +46,7 @@ modular_cc_library(
         "RemapAddressSpaces.h",
         "SPIRVBinary.h",
         "SubgroupSize.h",
+        "ZeroLengthArrays.h",
     ],
     includes = ["."],
     deps = [
@@ -188,6 +190,23 @@ modular_cc_test(
         "@llvm-project//llvm:AsmParser",
         "@llvm-project//llvm:Core",
         "@llvm-project//llvm:Support",
+    ],
+)
+
+modular_cc_test(
+    name = "ZeroLengthArraysTest",
+    size = "small",
+    srcs = ["test/ZeroLengthArraysTest.cpp"],
+    deps = [
+        ":IntelPasses",
+        "@llvm-project//llvm:AsmParser",
+        "@llvm-project//llvm:Core",
+        "@llvm-project//llvm:MC",
+        "@llvm-project//llvm:SPIRVCodeGen",
+        "@llvm-project//llvm:SPIRVInfo",
+        "@llvm-project//llvm:Support",
+        "@llvm-project//llvm:Target",
+        "@llvm-project//llvm:TargetParser",
     ],
 )
 
