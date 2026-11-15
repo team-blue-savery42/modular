@@ -28,6 +28,7 @@ modular_cc_library(
         "Convergent.cpp",
         "DynamicSharedMemory.cpp",
         "Heap.cpp",
+        "PromoteBFloat16.cpp",
         "RemapAddressSpaces.cpp",
         "SPIRVBinary.cpp",
         "SubgroupSize.cpp",
@@ -38,6 +39,7 @@ modular_cc_library(
         "Convergent.h",
         "DynamicSharedMemory.h",
         "Heap.h",
+        "PromoteBFloat16.h",
         "RemapAddressSpaces.h",
         "SPIRVBinary.h",
         "SubgroupSize.h",
@@ -168,6 +170,19 @@ modular_cc_test(
     srcs = ["test/HeapTest.cpp"],
     deps = [
         ":IntelPasses",
+        "@llvm-project//llvm:AsmParser",
+        "@llvm-project//llvm:Core",
+        "@llvm-project//llvm:Support",
+    ],
+)
+
+modular_cc_test(
+    name = "PromoteBFloat16Test",
+    size = "small",
+    srcs = ["test/PromoteBFloat16Test.cpp"],
+    deps = [
+        ":IntelPasses",
+        "@llvm-project//llvm:Analysis",
         "@llvm-project//llvm:AsmParser",
         "@llvm-project//llvm:Core",
         "@llvm-project//llvm:Support",

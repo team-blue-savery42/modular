@@ -28,6 +28,7 @@
 #include "Heap.h"
 #include "IntelAddressSpace.h"
 #include "IntelTraits.h"
+#include "PromoteBFloat16.h"
 #include "RemapAddressSpaces.h"
 #include "SPIRVBinary.h"
 #include "SubgroupSize.h"
@@ -190,6 +191,7 @@ public:
 protected:
   /// The rewrites that must see the optimized module, just before llc.
   static llvm::Error prepareForCodegen(llvm::Module &module) {
+    promoteBFloat16(module);
     expandStepVectors(module);
     expandGlobalAddressSpaceCasts(module);
     retypeAggregatePointers(module);
