@@ -28,6 +28,7 @@
 #include "Heap.h"
 #include "IntelAddressSpace.h"
 #include "IntelTraits.h"
+#include "MaskBitcasts.h"
 #include "NestedStructArguments.h"
 #include "PromoteBFloat16.h"
 #include "RemapAddressSpaces.h"
@@ -202,6 +203,10 @@ protected:
     promoteBFloat16(module);
     expandStepVectors(module);
     splitWideVectors(module);
+    if (llvm::Expected<bool> rewritten = rewriteMaskBitcasts(module);
+        !rewritten)
+      return rewritten.takeError();
+    expandMaskTruncs(module);
     expandGlobalAddressSpaceCasts(module);
     retypeAggregatePointers(module);
     flattenZeroLengthArrayGEPs(module);
