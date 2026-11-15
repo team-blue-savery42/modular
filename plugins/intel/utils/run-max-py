@@ -1,0 +1,71 @@
+#!/bin/sh
+# ===----------------------------------------------------------------------=== #
+# Copyright (c) 2026, Sean Avery. All rights reserved.
+#
+# Licensed under the Apache License v2.0 with LLVM Exceptions:
+# https://llvm.org/LICENSE.txt
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ===----------------------------------------------------------------------=== #
+
+# Run on the GPU host: runs a Python script with MAX's Python
+# packages on the B70, through MAX's graph runtime built with
+# --//:hal_device_context=true, with our compiler and driver plugins.
+# Usage: utils/run-max-py SCRIPT.py [ARG...]
+# It builds //max/python/max/_entrypoints:pipelines in that configuration (the
+# target that carries MAX's Python packages, their pip dependencies and the
+# Mojo kernel packages), then runs SCRIPT with the hermetic Python of that
+# target's runfiles and the same import path and environment its launcher
+# sets. HF_HUB_OFFLINE=1: models come from local paths. RUN_MAX_PY_ENV adds
+# environment assignments (e.g. "MODULAR_DEBUG=ir-output-dir=/tmp/ir");
+# RUN_MAX_PY_WRAPPER a command to run it under (e.g. unitrace -d).
+# RUN_MAX_PY_OPT=1 builds and runs everything with --compilation_mode=opt
+# (outputs under bazel-out/mojo_host_platform-opt, bazel-bin left pointing
+# at the default debug build). The plugins are built first, in the same
+# configuration.
+set -eu
+[ $# -ge 1 ] || { echo "usage: $0 SCRIPT.py [ARG...]" >&2; exit 2; }
+script=$(cd "$(dirname "$1")" && pwd)/$(basename "$1")
+shift
+# The checkout this script is in; MODULAR_DIR overrides it.
+modular=${MODULAR_DIR:-$(cd "$(dirname "$0")/../../.." && pwd)}
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
+flags=
+bin=$modular/bazel-bin
+if [ "${RUN_MAX_PY_OPT:-0}" = 1 ]; then
+  flags="--compilation_mode=opt --symlink_prefix=/dev/null"
+  bin=$(cd "$modular" && ./bazelw info $flags output_path 2>/dev/null)/mojo_host_platform-opt/bin
+fi
+# The plugins in the same configuration (otherwise a debug run uses
+# whatever plugins bazel-bin holds).
+# shellcheck disable=SC2086 # $flags is a list of words.
+(cd "$modular" && ./bazelw build $flags //plugins/intel/compiler:IntelCompilerPlugin.so \
+  //plugins/intel/driver:LevelZeroPlugin.so //Target:CPUPlugin.so > "$work/plugins.log" 2>&1) ||
+  { cat "$work/plugins.log" >&2; exit 1; }
+# shellcheck disable=SC2086 # $flags is a list of words.
+(cd "$modular" && ./bazelw run $flags --//:hal_device_context=true \
+  --script_path="$work/launch.sh" //max/python/max/_entrypoints:pipelines \
+  > "$work/build.log" 2>&1) || { cat "$work/build.log" >&2; exit 1; }
+# The launcher's last line runs the pipelines script from runfiles/_main.
+launcher=$(sed -n 's#^  \(/.*/pipelines\) "\$@"$#\1#p' "$work/launch.sh")
+runfiles=$launcher.runfiles
+imports=$(sed -n "s/^  python_imports = '\(.*\)'$/\1/p" "$launcher")
+pythonpath=$(echo "$imports" | tr ':' '\n' | sed "s#^#$runfiles/#" | paste -sd:)
+python=$(ls "$runfiles"/rules_python++python+python_3_13_x86_64-unknown-linux-gnu/bin/python3 2>/dev/null || true)
+[ -n "$python" ] || { echo "run-max-py: no hermetic python in $runfiles" >&2; exit 1; }
+# Same environment and working directory as the launcher, our script instead;
+# RUNFILES_DIR lets MAX's C++ find its runtime libraries (BazelRunfiles.cpp),
+# as the launcher's bootstrap sets it.
+sed "s#^  $launcher \"\$@\"\$#  RUNFILES_DIR=$runfiles PYTHONPATH=$pythonpath $python -u \"\$@\"#" \
+  "$work/launch.sh" > "$work/run.sh"
+grep -q "$python -u" "$work/run.sh" || { echo "run-max-py: launcher format changed" >&2; exit 1; }
+export MODULAR_COMPILER_PLUGINS=$bin/plugins/intel/compiler/IntelCompilerPlugin.so
+export MODULAR_DRIVER_PLUGINS="level_zero@$bin/plugins/intel/driver/LevelZeroPlugin.so;CPU@$bin/Target/CPUPlugin.so"
+export HF_HUB_OFFLINE=1
+# shellcheck disable=SC2086 # RUN_MAX_PY_ENV and _WRAPPER are lists of words.
+env ${RUN_MAX_PY_ENV:-} ${RUN_MAX_PY_WRAPPER:-} bash "$work/run.sh" "$script" "$@"

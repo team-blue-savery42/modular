@@ -1,0 +1,907 @@
+#!/usr/bin/env python3
+# ===----------------------------------------------------------------------=== #
+# Copyright (c) 2026, Sean Avery. All rights reserved.
+#
+# Licensed under the Apache License v2.0 with LLVM Exceptions:
+# https://llvm.org/LICENSE.txt
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ===----------------------------------------------------------------------=== #
+
+"""Run MAX's GPU tests on an Intel GPU through the DeviceContext compat
+layer.
+
+Run on the GPU host (it builds what the tests import, with
+--//:hal_device_context=true):
+    utils/check-max-gpu [-j JOBS] [-k SUBSTRING ...] [-o TABLE.md] [--logs DIR]
+                        [--logs-all] [--expect tests/max-gpu-expected.txt]
+
+Each test runs with `mojo run -D ASSERT=all --target-accelerator=intel:bmg-g31`
+(assertions on, as Modular's test rules build them): the Intel compiler plugin
+builds its kernels, and MAX's DeviceContext, built on the HAL (the compat
+layer), runs them through the Level Zero driver plugin. A test whose source has
+CHECK lines also has its stdout checked with FileCheck, as Modular's
+mojo_filecheck_test does. A test is
+  pass     exited 0 (or, for the one test that must crash, didn't exit 0), and
+           its output passed FileCheck; or, for a test whose lit RUN line
+           expects it not to compile, didn't compile, exited with an error
+           code rather than by a signal, and its output passed FileCheck
+           (stderr goes into stdout's pipe, as the RUN line's 2>&1 does, so
+           the lines reach FileCheck in the order they were written);
+  fail     compiled and ran, but failed (the first error is shown); or, for a
+           test expected not to compile, compiled, or didn't compile but its
+           output failed FileCheck, or died by a signal (as lit's `not`
+           without `--crash` counts it), even after the expected errors and
+           with FileCheck passing. Only the mojo process's own death by a
+           signal counts as one: a crash in the program `mojo run` executes
+           is caught by mojo, which prints "execution crashed" and exits 1,
+           so it is judged as any other exit 1 is (lit's `not` inverts that
+           exit 1 too);
+  compile  didn't compile (the first error is shown);
+  timeout  ran longer than the limit;
+  n/a      didn't pass, and is a lit test whose RUN lines all build for
+           another vendor's target.
+
+Defines: a test's Bazel rule's `-D` copts are passed too (rules_mojo
+passes `copts` to the compile). A lit test whose RUN commands that name no
+target or an Intel one pass `-D` defines is run by those commands instead,
+read as lit reads them (Modular's `%mojo...` substitutions, `not`, `2>&1`,
+`| FileCheck %s --check-prefix=P`; a prefix with no lines fails, as in
+FileCheck), each with -I and the plugins and, unlike lit, which adds no
+target, our accelerator when it names none; it passes when they all pass. Its
+commands that name only other vendors' targets aren't run.
+
+utils/check-max-gpu --self-test checks how tests expected not to compile are
+judged, and how RUN lines and Bazel copts are read, without Mojo or the GPU.
+
+With --expect FILE (lines `<test> <result> <cause>`), each result is compared
+with the file: `better` (now passes), `worse` (passed, now doesn't),
+`changed` (another non-pass result) or `new`; the exit code is 1 when any test
+got worse. Without it, 1 unless every test passed.
+
+GPU faults: after a process whose kernel page-faults, the next process to
+use the GPU hangs at its first wait. The kernel log's faults during the run
+are matched to the tests running at the time; when there were any, each test
+that timed out and was still running at or after the first fault is rerun
+once, alone, after a throwaway GPU process, and reported `stranded` if the
+rerun's result differs. Tests known to fault (FAULTING) run alone after the
+others, followed by a throwaway process, so that they strand nothing.
+
+Scope: the tests of max.gpu (max/mojo/test/gpu), MAX's GPU algorithm
+and math tests, and the basic max/kernels GPU tests (basics, algorithm,
+examples: elementwise, reductions, naive and tiled matmuls); MAX's
+vendor-neutral matmul tests (LINALG_TESTS), the nn norm, RoPE and KV-cache
+store tests (NN_NAMES, KVC_NAMES), the Gated DeltaNet's (SSM_NAMES), and
+the paged flash-attention test per page and head size (VARIANTS).
+"""
+
+import argparse
+import json
+import os
+import re
+import shlex
+import subprocess
+import sys
+import tempfile
+import time
+
+from concurrent.futures import ThreadPoolExecutor
+
+# The checkout this script is in (plugins/intel/utils); MODULAR_DIR
+# overrides it.
+MODULAR = os.environ.get("MODULAR_DIR") or os.path.dirname(os.path.dirname(
+    os.path.dirname(os.path.dirname(os.path.realpath(__file__)))))
+MOJO = os.path.expanduser(os.environ.get("INTEL_PLUGIN_BIN", os.path.expanduser("~/.cache/intel-plugin/bin")) + "/mojo")
+COMPILER = f"{MODULAR}/bazel-bin/plugins/intel/compiler/IntelCompilerPlugin.so"
+DRIVER = f"{MODULAR}/bazel-bin/plugins/intel/driver/LevelZeroPlugin.so"
+# The CPU driver plugin, listed after ours so that `DeviceContext(api="cpu")`
+# finds one as it would outside the HAL compat layer (test_device_view's
+# test_device_cannot_peer_cpu). The accelerator stays the first entry.
+CPU_DRIVER = f"{MODULAR}/bazel-bin/Target/CPUPlugin.so"
+DRIVER_SPEC = f"level_zero@{DRIVER};CPU@{CPU_DRIVER}"
+FILECHECK = "FileCheck"
+ACCELERATOR = "intel:bmg-g31"
+HAL = "--//:hal_device_context=true"
+# max reads this define to pick the HAL DeviceContext; Bazel's Mojo
+# toolchain passes it under HAL, mojo run needs it given.
+HAL_DEFINE = ["-D", "HAL_DEVICE_CONTEXT"]
+DIRS = [
+    "max/mojo/test/gpu",
+    "max/mojo/test/algorithm/gpu",
+    "max/mojo/test/math/gpu",
+    "max/kernels/test/gpu/basics",
+    "max/kernels/test/gpu/algorithm",
+    "max/kernels/test/gpu/examples",
+    "max/kernels/test/gpu/memory",
+]
+# MAX's vendor-neutral GPU matmul tests: the ones of linalg's GPU
+# tests that go through `_matmul_gpu` (and its GEMV and batched paths) and
+# that Modular's BUILD file doesn't limit to one vendor's GPU. The rest of
+# that directory is vendor-specific (SM90/SM100, AMD, Apple, cuBLAS ...).
+LINALG = "max/kernels/test/gpu/linalg"
+LINALG_NAMES = (
+    "test_batched_matmul",
+    "test_gemv",
+    "test_gemv2",
+    "test_linalg_matmul_gpu",
+    "test_matmul",
+    "test_matmul_custom",
+    "test_matmul_gpu_epilogue_closures",
+)
+LINALG_TESTS = [f"{LINALG}/{t}.mojo" for t in LINALG_NAMES]
+# MAX's GPU nn kernel tests for the ops Qwen3.5-0.8B runs: the
+# vendor-neutral ones of max/kernels/test/gpu/nn.
+NN = "max/kernels/test/gpu/nn"
+NN_NAMES = (
+    "test_fused_qk_rope_ragged",
+    "test_layer_norm",
+    "test_rms_norm",
+    "test_rope_ragged",
+    "test_rope_ragged_position_ids",
+    # the embedding gather, scatter_nd and the sampler.
+    "test_gather",
+    "test_gather_nd",
+    "test_scatter_nd",
+    "test_fused_token_sampling_greedy",
+    "test_argmax_with_bias",
+    "test_topk_gpu",
+    "test_topk_gpu_fi",
+    "test_topk_greedy_tiebreak",
+    "test_topk_per_row",
+    "test_topk_softmax_sample_topk_arr",
+)
+LINALG_TESTS += [f"{NN}/{t}.mojo" for t in NN_NAMES]
+# ... and of max/kernels/test/gpu/kv_cache.
+KVC = "max/kernels/test/gpu/kv_cache"
+KVC_NAMES = ("test_batch_kv_cache_flash_attention",
+             "test_batch_kv_cache_flash_attention_causal_mask",
+             "test_kv_cache_store_ragged", "test_mha_decoding_vs_naive",
+             "test_mha_mixed_ce_tg")
+LINALG_TESTS += [f"{KVC}/{t}.mojo" for t in KVC_NAMES]
+# Tests that Modular's BUILD file builds several times from one source with
+# different `-D` copts: run once per variant, as `SOURCE@VARIANT`,
+# with that target's defines. The paged ragged flash-attention test, split by
+# page size and head size: its page-256 targets for heads of 64 and 128 are
+# for every GPU; 256 (H100/B200 only upstream) is Qwen3.5's head size, which
+# the Intel kernels take.
+PAGED_FA = "test_batch_kv_cache_flash_attention_causal_mask_ragged_paged"
+VARIANTS = {
+    f"{KVC}/{PAGED_FA}.mojo@ps256_hs{hs}": (
+        f"//{KVC}:{PAGED_FA}_ps256_hs{hs}.mojo.test",
+        ["-D", "page_size=256", "-D", f"head_size={hs}"])
+    for hs in (64, 128, 256)
+}
+LINALG_TESTS += list(VARIANTS)
+# ... and of max/kernels/test/gpu/state_space: the Gated DeltaNet's.
+SSM = "max/kernels/test/gpu/state_space"
+SSM_NAMES = ("test_gated_delta", "test_gated_delta_conv1d",
+             "test_gated_delta_spec_ring", "test_gated_group_rmsnorm")
+LINALG_TESTS += [f"{SSM}/{t}.mojo" for t in SSM_NAMES]
+# The Bazel targets whose rules give the tests' packages and defines.
+QUERY_TARGETS = " + ".join([f"//{d}/..." for d in DIRS]
+                           + [f"//{LINALG}:{t}.mojo.test" for t in LINALG_NAMES]
+                           + [f"//{NN}:{t}.mojo.test" for t in NN_NAMES]
+                           + [f"//{KVC}:{t}.mojo.test" for t in KVC_NAMES]
+                           + [f"//{SSM}:{t}.mojo.test" for t in SSM_NAMES]
+                           + [v[0] for v in VARIANTS.values()])
+# Tests known to page-fault the GPU, which leaves the next process to use it
+# hanging: they run alone after the others, then a throwaway process takes
+# the hang. test_amd_format: its float8_e5m2 kernel page-faulted (at address
+# 0, by the kernel log) while IGC made it write to an undefined private
+# address (aggregate phis); since the compiler plugin splits aggregate phis
+# it passes without a fault, and it stays here so that a build without the
+# workaround strands nothing.
+FAULTING = {"max/kernels/test/gpu/basics/test_amd_format.mojo"}
+# Tests that pass by failing at run time, as their lit RUN lines expect; the
+# failure must not be a compile error, and their CHECK lines must match.
+EXPECT_CRASH = {"max/kernels/test/gpu/basics/test_debug_assert_gpu_error.mojo"}
+# Tests that pass by failing to compile, as their lit RUN lines expect (`RUN:
+# not %bare-mojo %s 2>&1 | FileCheck %s`): FileCheck reads stdout and stderr
+# interleaved, as written (run_command's `merge`).
+# test_sin_cos_f64 builds for H100 (`_h100_target`) and checks NVIDIA's
+# "float64 is not supported" constraints; no GPU is used.
+EXPECT_COMPILE_ERROR = {"max/mojo/test/math/gpu/test_sin_cos_f64.mojo"}
+PACKAGE_QUERY = (
+    "kind('mojo_library', deps("
+    + QUERY_TARGETS + "))")
+# std is built into mojo; //max/mojo/max:max is the legacy DeviceContext, and
+# the HAL one (the compat layer) is max_license's overlay of it.
+SKIP_PACKAGES = ("//Mojo/stdlib/std:std", "//max/mojo/max:max")
+EXTRA_PACKAGES = ("//max/mojo/max/_driver/max_license:max",)
+COMPILE_ERRORS = re.compile(
+    r"failed to parse|failed to run the pass manager|function instantiation "
+    r"failed|JIT session error|Failed to materialize|constraint failed|"
+    r"LLVM ERROR|intel plugin:|failed to lower module")
+SPECIFIC = [
+    re.compile(r"constraint failed:.*"),
+    re.compile(r"intel plugin:.*"),
+    re.compile(r"LLVM ERROR:.*"),
+    re.compile(r"Unhandled exception caught during execution:.*"),
+    re.compile(r"AssertionError:.*"),
+    re.compile(r"Assert Error:.*"),
+    re.compile(r"JIT session error:.*"),
+    re.compile(r"error: (?!failed to run the pass manager|function instantiation"
+               r" failed|failed to lower module|failed to parse|execution exited"
+               r"|execution crashed).*"),
+    re.compile(r"error:.*"),
+]
+LOGS = ""
+LOGS_ALL = False
+# Defines from the tests' Bazel rules (bazel_defines), set by main.
+DEFINES = {}
+HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# A RUN line's target: `--target-accelerator X` or `-D TARGET=X`.
+RUN_TARGET = re.compile(r"--target-accelerator[ =](\S+)|-D TARGET=(\S+)")
+
+
+def bazel(*args, raw=False):
+    out = subprocess.run(["./bazelw", *args], cwd=MODULAR, capture_output=True,
+                         text=True, check=True).stdout
+    return out if raw else out.split()
+
+
+def copt_defines(copts):
+    """The `-D NAME=VALUE` (or `-DNAME=VALUE`) pairs of a list of compiler
+    options, as ["-D", "NAME=VALUE", ...]; other options are left out."""
+    defines, i = [], 0
+    while i < len(copts):
+        if copts[i] == "-D" and i + 1 < len(copts):
+            defines += ["-D", copts[i + 1]]
+            i += 2
+            continue
+        if copts[i].startswith("-D") and len(copts[i]) > 2:
+            defines += ["-D", copts[i][2:]]
+        i += 1
+    return defines
+
+
+def bazel_defines():
+    """The defines each test's Bazel rule passes to the compiler: {test path:
+    ["-D", "NAME=VALUE", ...]}, from the `copts` of the mojo_test rules in
+    DIRS (rules_mojo passes `copts` to the compile, e.g.
+    test_tracing_missing_library's `-D MODULAR_ENABLE_GPU_PROFILING_DETAILED=1`).
+    `bazel query` doesn't resolve a configurable (select) attribute for one
+    configuration, so a `-D` inside a select in `copts` might not be read as
+    a build would; no rule in DIRS has one (the only `-D` copt in
+    their BUILD files is the one above)."""
+    query = "kind('mojo_test', " + QUERY_TARGETS + ")"
+    defines = {}
+    for line in bazel("query", query, "--output=streamed_jsonproto",
+                      raw=True).splitlines():
+        rule = json.loads(line).get("rule", {})
+        attrs = {a["name"]: a.get("stringListValue", [])
+                 for a in rule.get("attribute", [])}
+        found = copt_defines(attrs.get("copts", []))
+        if not found:
+            continue
+        for src in attrs.get("srcs", []):
+            if src.startswith("//") and src.endswith(".mojo"):
+                defines[src[2:].replace(":", "/")] = found
+    return defines
+
+
+def include_dirs():
+    """Builds the libraries the tests import and returns their directories."""
+    packages = [p for p in bazel("query", PACKAGE_QUERY)
+                if not p.startswith("@") and p not in SKIP_PACKAGES]
+    packages += EXTRA_PACKAGES
+    bazel("build", HAL, *packages, "//Mojo:mojo",
+          "//plugins/intel/compiler:IntelCompilerPlugin.so",
+          "//plugins/intel/driver:LevelZeroPlugin.so", "//Target:CPUPlugin.so")
+    dirs = []
+    for f in bazel("cquery", HAL, "--output=files", " + ".join(packages)):
+        d = os.path.join(MODULAR, os.path.dirname(f))
+        if d not in dirs:
+            dirs.append(d)
+    return dirs
+
+
+def first_error(text):
+    lines = [l for l in text.splitlines()
+             if "deprecated" not in l and "warning:" not in l]
+    for pattern in SPECIFIC:
+        for line in lines:
+            m = pattern.search(line)
+            if m:
+                return m.group(0).strip()
+    lines = [l for l in lines if l.strip()]
+    return lines[-1].strip() if lines else "failed"
+
+
+def run_commands(text):
+    """The lit RUN commands of a test's source `text`, continuation lines
+    (a trailing backslash) joined."""
+    commands, current = [], ""
+    for line in text.splitlines():
+        m = re.match(r"\s*# RUN:(.*)", line)
+        if not m:
+            continue
+        current += " " + m.group(1).rstrip()
+        if current.endswith("\\"):
+            current = current[:-1]
+            continue
+        commands.append(current.strip())
+        current = ""
+    return commands
+
+
+def source_path(test):
+    """The source file of `test` (a path, or `SOURCE@VARIANT`)."""
+    return os.path.join(MODULAR, test.split("@")[0])
+
+
+def read_source(test):
+    with open(source_path(test)) as f:
+        return f.read()
+
+
+def is_ours(command):
+    """Whether a RUN command names no target or an Intel one."""
+    targets = [a or b for a, b in RUN_TARGET.findall(command)]
+    return not targets or any("intel" in t or "bmg" in t for t in targets)
+
+
+def other_vendor_only(test):
+    """Whether `test` is a lit test whose every RUN command names a target
+    that isn't Intel's."""
+    commands = run_commands(read_source(test))
+    return bool(commands) and not any(is_ours(c) for c in commands)
+
+
+# Modular's lit substitutions for mojo (bazel/internal/llvm-lit/
+# lit.common.cfg.py, without a sanitizer and with assertions on, as Bazel runs
+# them), longest name first, as lit's ToolSubst matches whole words.
+LIT_MOJO = {
+    "%mojo-build-no-debug-no-assert": ["build", "-Werror"],
+    "%mojo-build-no-debug": ["build", "-Werror", "-D", "ASSERT=all"],
+    "%mojo-build-no-werror": ["build", "-D", "ASSERT=all", "--debug-level",
+                              "full"],
+    "%mojo-build": ["build", "-Werror", "-D", "ASSERT=all", "--debug-level",
+                    "full"],
+    "%mojo-no-debug-no-assert": ["-Werror"],
+    "%mojo-no-debug": ["-Werror", "-D", "ASSERT=all"],
+    "%mojo": ["-Werror", "-D", "ASSERT=all", "--debug-level", "full"],
+    "%bare-mojo": [],
+}
+
+
+def parse_run(command):
+    """A RUN command of the shape `[not] <%mojo...> ARGS [2>&1] [| FileCheck %s
+    [--check-prefix=P]]` as a dict: `negate` (lit's `not`), `args` (mojo's
+    arguments after the substitution, `%s` and `%t` left in), `merge` (2>&1),
+    `filecheck` (whether output goes to FileCheck) and `prefix`; None for any
+    other shape."""
+    pipeline = command.split("|")
+    if len(pipeline) > 2:
+        return None
+    words = shlex.split(pipeline[0])
+    negate = bool(words) and words[0] == "not"
+    if negate:
+        words = words[1:]
+    if not words or words[0] not in LIT_MOJO:
+        return None
+    merge = "2>&1" in words
+    words = [w for w in words if w != "2>&1"]
+    if any(w.startswith((">", "<", "2>")) for w in words):
+        return None
+    args = LIT_MOJO[words[0]] + words[1:]
+    if args[:1] != ["build"]:
+        args = ["run"] + args
+    prefix, filecheck = "CHECK", False
+    if len(pipeline) == 2:
+        check = shlex.split(pipeline[1])
+        if not check or check[0] != "FileCheck" or "%s" not in check:
+            return None
+        filecheck = True
+        for i, w in enumerate(check):
+            if w.startswith("--check-prefix="):
+                prefix = w.split("=", 1)[1]
+            elif w in ("--check-prefix", "-check-prefix") and i + 1 < len(check):
+                prefix = check[i + 1]
+            elif w not in ("FileCheck", "%s"):
+                return None
+    return {"negate": negate, "args": args, "merge": merge,
+            "filecheck": filecheck, "prefix": prefix}
+
+
+def lit_plan(test):
+    """The RUN commands the gate runs for `test`, parsed (parse_run), or None
+    when it runs `test` the usual way (`mojo run`, FileCheck on the default
+    prefix). A lit test is run by its RUN commands when the ones that name no
+    target or an Intel one (is_ours) pass `-D` defines: then each command
+    builds a different program, as in test_target_accelerator_detection,
+    whose RUN lines pick its checks with `-D EXPECT=...`. Commands that name
+    only other vendors' targets aren't run. A command of another shape than
+    parse_run reads leaves the test to the usual way."""
+    ours = [c for c in run_commands(read_source(test)) if is_ours(c)]
+    if not any(re.search(r"(^|\s)-D\s*\S", c) for c in ours):
+        return None
+    plan = [parse_run(c) for c in ours]
+    return None if any(p is None for p in plan) else plan
+
+
+def run_one(test, includes, limit):
+    start = time.time()
+    plan = lit_plan(test)
+    if plan:
+        result = run_lit(test, plan, includes, limit)
+    else:
+        result = run_test(test, includes, limit)
+    if result[1] != "pass" and other_vendor_only(test):
+        result = (test, "n/a", "lit test for other vendors' targets; " + result[2])
+    return (*result, time.time() - start, start)
+
+
+def kernel_faults(since):
+    """Times (epoch seconds) of the GPU page faults in the kernel log since
+    `since`, or [] if the log can't be read."""
+    try:
+        done = subprocess.run(
+            ["journalctl", "-k", "--since", f"@{int(since)}", "-o", "short-unix",
+             "--no-pager"], capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    return [float(line.split()[0]) for line in done.stdout.splitlines()
+            if "Engine memory CAT error" in line]
+
+
+def absorb_fault():
+    """Runs a throwaway GPU process (a plain Level Zero add, at most 30 s)
+    so the next test isn't the first process after a fault."""
+    source = os.path.join(HERE, "utils/l0/fault-absorb")
+    with tempfile.TemporaryDirectory() as work:
+        try:
+            subprocess.run(["clang", "-target", "spirv64", "-cl-std=CL2.0",
+                            "-O2", "-c", f"{source}/kernels.cl", "-o",
+                            f"{work}/k.spv"], check=True, capture_output=True)
+            subprocess.run(["clang++", "-O1", "-std=c++17",
+                            f"{source}/repro.cpp", "-o", f"{work}/repro",
+                            "-lze_loader"], check=True, capture_output=True)
+            subprocess.run([f"{work}/repro", "add", f"{work}/k.spv"],
+                           capture_output=True, timeout=30)
+        except (OSError, subprocess.SubprocessError):
+            pass
+
+
+def read_expected(path):
+    expected = {}
+    with open(path) as f:
+        for line in f:
+            fields = line.split(None, 2)
+            if len(fields) >= 2 and not line.startswith("#"):
+                expected[fields[0]] = (fields[1],
+                                       fields[2].strip() if len(fields) > 2 else "")
+    return expected
+
+
+def lit_command(step, test, includes, work):
+    """The argv of a parsed RUN command (parse_run): mojo with the
+    substitution's arguments, the gate's -I directories, our accelerator when
+    the command names none, `%s` as the test and `%t` as a file in `work`."""
+    args = step["args"]
+    cmd = [MOJO, args[0]]
+    for d in includes:
+        cmd += ["-I", d]
+    if not RUN_TARGET.search(" ".join(args)):
+        cmd.append(f"--target-accelerator={ACCELERATOR}")
+    cmd += HAL_DEFINE
+    source = source_path(test)
+    cmd += [source if a == "%s" else os.path.join(work, "out") if a == "%t"
+            else a for a in args[1:]]
+    return cmd
+
+
+def judge_step(test, step, returncode, out, checked):
+    """The (result, detail) of one RUN command that exited with `returncode`
+    and wrote `out` (stdout and stderr), of which FileCheck reads `checked`
+    (stdout, with stderr in it when the command has 2>&1): as
+    judge_compile_error for `not` commands, else pass on exit 0 and FileCheck;
+    a nonzero exit is `compile` when the output shows a compile error."""
+    prefix = step["prefix"] if step["filecheck"] else None
+    if step["negate"]:
+        return judge_compile_error(test, returncode, out, prefix, checked,
+                                   required=True)[1:]
+    if returncode != 0:
+        return ("compile" if COMPILE_ERRORS.search(out) else "fail",
+                first_error(out))
+    failed = filecheck(test, checked, prefix, required=True) if prefix else ""
+    if failed:
+        return "fail", "FileCheck: " + first_error(failed)
+    return "pass", ""
+
+
+def run_lit(test, plan, includes, limit):
+    """Runs `test` by its RUN commands (lit_plan): it passes when every one
+    passes; otherwise the first that didn't gives the result."""
+    outputs = []
+    for n, step in enumerate(plan, 1):
+        with tempfile.TemporaryDirectory() as work:
+            env = dict(os.environ, MODULAR_COMPILER_PLUGINS=COMPILER,
+                       MODULAR_DRIVER_PLUGINS=DRIVER_SPEC,
+                       MODULAR_CACHE_DIR=os.path.join(work, "cache"))
+            cmd = lit_command(step, test, includes, work)
+            try:
+                done = run_command(cmd, env, work, limit, step["merge"])
+            except subprocess.TimeoutExpired as e:
+                out = (e.stdout or b"").decode(errors="replace") if isinstance(
+                    e.stdout, bytes) else (e.stdout or "")
+                save(test, "\n".join(outputs + [out]))
+                return test, "timeout", f"RUN command {n}: no result after {limit} s"
+        out = done.stdout if step["merge"] else done.stdout + done.stderr
+        outputs.append(f"---- RUN command {n}: {' '.join(cmd)}\n{out}")
+        result, why = judge_step(test, step, done.returncode, out, done.stdout)
+        if result != "pass":
+            save(test, "\n".join(outputs))
+            return test, result, f"RUN command {n} of {len(plan)}: {why}"
+    if LOGS_ALL:
+        save(test, "\n".join(outputs))
+    return test, "pass", ""
+
+
+def run_test(test, includes, limit):
+    with tempfile.TemporaryDirectory() as work:
+        env = dict(os.environ, MODULAR_COMPILER_PLUGINS=COMPILER,
+                   MODULAR_DRIVER_PLUGINS=DRIVER_SPEC,
+                   MODULAR_CACHE_DIR=os.path.join(work, "cache"))
+        cmd = [MOJO, "run", "-D", "ASSERT=all",
+               f"--target-accelerator={ACCELERATOR}"] + HAL_DEFINE
+        cmd += VARIANTS[test][1] if test in VARIANTS else DEFINES.get(test, [])
+        for d in includes:
+            cmd += ["-I", d]
+        cmd.append(source_path(test))
+        merge = test in EXPECT_COMPILE_ERROR
+        try:
+            done = run_command(cmd, env, work, limit, merge)
+        except subprocess.TimeoutExpired as e:
+            out = (e.stdout or b"").decode(errors="replace") if isinstance(
+                e.stdout, bytes) else (e.stdout or "")
+            save(test, out)
+            return test, "timeout", f"no result after {limit} s"
+        if merge:
+            return judge_compile_error(test, done.returncode, done.stdout)
+        out = done.stdout + done.stderr
+        if done.returncode != 0 and COMPILE_ERRORS.search(out):
+            save(test, out)
+            return test, "compile", first_error(out)
+        if (done.returncode != 0) == (test in EXPECT_CRASH):
+            failed = filecheck(test, done.stdout)
+            if failed:
+                save(test, out + "\n---- FileCheck ----\n" + failed)
+                return test, "fail", "FileCheck: " + first_error(failed)
+            if LOGS_ALL:
+                save(test, out)
+            return test, "pass", ""
+        save(test, out)
+        if test in EXPECT_CRASH:
+            return test, "fail", "expected a crash, exited 0"
+        return test, "fail", first_error(out)
+
+
+def run_command(cmd, env, cwd, limit, merge=False):
+    """Runs `cmd`, capturing its output; with `merge`, stderr goes into
+    stdout's pipe, as a shell's `2>&1` does, so `.stdout` has both streams in
+    the order they were written and `.stderr` is None."""
+    return subprocess.run(cmd, env=env, cwd=cwd, stdout=subprocess.PIPE,
+                          stderr=subprocess.STDOUT if merge else subprocess.PIPE,
+                          text=True, timeout=limit, start_new_session=True)
+
+
+def judge_compile_error(test, returncode, out, prefix="CHECK", checked=None,
+                        required=False):
+    """The result of a test in EXPECT_COMPILE_ERROR (or of a `not` RUN
+    command) that exited with `returncode` and wrote `out` (stdout and stderr
+    merged): `pass` when it didn't compile and `checked` (default `out`)
+    passes FileCheck with `prefix` (None: no FileCheck; `required` as in
+    filecheck), else `fail`; never `compile`, which for these tests is the
+    expected outcome, not a result.
+    Death by a signal (`returncode` < 0) is a `fail`, as lit's `not` without
+    `--crash` counts a crash as a failure even after the expected errors."""
+    checked = out if checked is None else checked
+    if returncode < 0:
+        save(test, out)
+        return test, "fail", f"expected a compile error, crashed (signal {-returncode})"
+    if returncode == 0 or not COMPILE_ERRORS.search(out):
+        save(test, out)
+        return test, "fail", "expected a compile error, got none"
+    failed = filecheck(test, checked, prefix, required) if prefix else ""
+    if failed:
+        save(test, out + "\n---- FileCheck ----\n" + failed)
+        return test, "fail", ("compile error as expected, but FileCheck: "
+                              + first_error(failed))
+    if LOGS_ALL:
+        save(test, out)
+    return test, "pass", ""
+
+
+def self_test():
+    """Checks run_command's merge and judge_compile_error on a stand-in
+    program whose CHECK lines alternate between stdout and stderr; returns
+    the number of checks that failed."""
+    program = (
+        "import sys\n"
+        "for i in range(3):\n"
+        "    print(f'out {i}', flush=True)\n"
+        "    print(f'error: constraint failed: err {i}', file=sys.stderr,"
+        " flush=True)\n"
+        "import os, signal\n"
+        "if sys.argv[1] == 'crash':\n"
+        "    os.kill(os.getpid(), signal.SIGABRT)\n"
+        "sys.exit(int(sys.argv[1]))\n")
+    checks = "".join(f"# CHECK: out {i}\n# CHECK: err {i}\n" for i in range(3))
+    failures = 0
+    names = set()
+    with tempfile.TemporaryDirectory() as work:
+        source = os.path.join(work, "test_stand_in.mojo")
+        mutated = os.path.join(work, "test_mutated.mojo")
+        with open(source, "w") as f:
+            f.write(checks)
+        with open(mutated, "w") as f:
+            f.write(checks.replace("err 1", "err 7"))
+        cmd = [sys.executable, "-I", "-c", program]
+
+        def expect(what, got, want):
+            # Each check's name is its own, so a FAILED line names one
+            # check; a reused name is a failure.
+            nonlocal failures
+            if what in names:
+                failures += 1
+                print(f"FAILED {what}: the name of another check")
+            names.add(what)
+            ok = got == want
+            failures += not ok
+            print(f"{'ok' if ok else 'FAILED':6} {what}: {got!r}"
+                  + ("" if ok else f", expected {want!r}"))
+
+        merged = run_command(cmd + ["1"], None, work, 60, merge=True)
+        expect("merged output is interleaved", merged.stdout.splitlines()[:2],
+               ["out 0", "error: constraint failed: err 0"])
+        expect("interleaved output passes",
+               judge_compile_error(source, merged.returncode, merged.stdout)[1],
+               "pass")
+        apart = run_command(cmd + ["1"], None, work, 60)
+        expect("stdout then stderr fails the same CHECK lines (the old way)",
+               judge_compile_error(source, apart.returncode,
+                                   apart.stdout + apart.stderr)[1], "fail")
+        result = judge_compile_error(mutated, merged.returncode, merged.stdout)
+        expect("a compile error with a FileCheck mismatch is a fail",
+               result[1], "fail")
+        expect("its detail names FileCheck",
+               result[2].startswith("compile error as expected, but FileCheck:"),
+               True)
+        ok = run_command(cmd + ["0"], None, work, 60, merge=True)
+        expect("exiting 0 is a fail",
+               judge_compile_error(source, ok.returncode, ok.stdout)[1], "fail")
+        crashed = run_command(cmd + ["crash"], None, work, 60, merge=True)
+        expect("the crashing stand-in died by a signal", crashed.returncode < 0,
+               True)
+        expect("its output alone passes FileCheck",
+               judge_compile_error(source, 1, crashed.stdout)[1], "pass")
+        result = judge_compile_error(source, crashed.returncode, crashed.stdout)
+        expect("expected errors then a crash is a fail", result[1], "fail")
+        expect("its detail names the crash", "crashed (signal" in result[2],
+               True)
+        # RUN lines and copts, shaped as test_target_accelerator_detection's
+        # and test_apple_mma_target's.
+        lit = os.path.join(work, "test_lit_stand_in.mojo")
+        with open(lit, "w") as f:
+            f.write(
+                "# RUN: %mojo-build --emit object --target-accelerator sm_90"
+                " -D EXPECT=nvidia %s -o %t\n"
+                "# RUN: %mojo-build --emit object --target-triple arm64-apple"
+                "-darwin \\\n# RUN:   --target-accelerator metal:4 -D EXPECT=a"
+                "pple %s -o %t\n"
+                "# RUN: not %mojo-build --emit object -D EXPECT=on_host %s -o"
+                " %t 2>&1 | FileCheck %s --check-prefix=CHECK-HOST\n"
+                "# RUN: %mojo -D TARGET=intel:bmg-g31 %s | FileCheck %s\n"
+                "# CHECK-HOST: err 0\n# CHECK-HOST: err 2\n")
+        commands = run_commands(open(lit).read())
+        expect("RUN lines with a continuation are 4 commands", len(commands),
+               4)
+        expect("which of them are ours", [is_ours(c) for c in commands],
+               [False, False, True, True])
+        step = parse_run(commands[2])
+        expect("`not %mojo-build ... 2>&1 | FileCheck` is read",
+               (step["negate"], step["merge"], step["filecheck"],
+                step["prefix"]), (True, True, True, "CHECK-HOST"))
+        expect("its mojo arguments", step["args"],
+               ["build", "-Werror", "-D", "ASSERT=all", "--debug-level", "full",
+                "--emit", "object", "-D", "EXPECT=on_host", "%s", "-o", "%t"])
+        expect("%mojo runs", parse_run(commands[3])["args"][:2],
+               ["run", "-Werror"])
+        argv = lit_command(step, lit, ["/inc"], work)
+        expect("its argv gets -I, our accelerator, %s and %t",
+               argv[1:5] + argv[-3:],
+               ["build", "-I", "/inc", f"--target-accelerator={ACCELERATOR}",
+                lit if os.path.isabs(lit) else os.path.join(MODULAR, lit),
+                "-o", os.path.join(work, "out")])
+        expect("its argv defines HAL_DEVICE_CONTEXT",
+               "HAL_DEVICE_CONTEXT" in argv, True)
+        expect("a command naming a target keeps it, without ours",
+               f"--target-accelerator={ACCELERATOR}" in lit_command(
+                   parse_run(commands[3]), lit, [], work), False)
+        expect("other shapes aren't read",
+               [parse_run(c) for c in ("%mojo %s > %t", "clang %s",
+                                       "%mojo %s | FileCheck --strict %s",
+                                       "%mojo %s | FileCheck %s | cat")],
+               [None, None, None, None])
+        expect("judged: the expected error and FileCheck pass",
+               judge_step(lit, step, 1, merged.stdout, merged.stdout)[0],
+               "pass")
+        expect("judged: exiting 0 fails",
+               judge_step(lit, step, 0, merged.stdout, merged.stdout)[0],
+               "fail")
+        # The RUN command's FileCheck prefix is the one used: this stand-in's
+        # plain CHECK lines match the output and its CHECK-HOST line doesn't, so
+        # only the prefix decides; and a prefix with no lines fails, as
+        # FileCheck does under lit.
+        other = os.path.join(work, "test_lit_prefix.mojo")
+        with open(other, "w") as f:
+            f.write("# CHECK: out 0\n# CHECK: err 0\n# CHECK-HOST: err 9\n")
+        expect("judged: a `not` command's own prefix decides",
+               judge_step(other, step, 1, merged.stdout, merged.stdout)[0],
+               "fail")
+        piped = parse_run("%mojo %s | FileCheck %s --check-prefix=CHECK-HOST")
+        expect("judged: a command's own prefix decides",
+               judge_step(other, piped, 0, merged.stdout, merged.stdout)[0],
+               "fail")
+        expect("judged: its default prefix passes the same output",
+               judge_step(other, parse_run("%mojo %s | FileCheck %s"), 0,
+                          merged.stdout, merged.stdout)[0], "pass")
+        none = parse_run("not %mojo %s 2>&1 | FileCheck %s --check-prefix=NONE")
+        result = judge_step(other, none, 1, merged.stdout, merged.stdout)
+        expect("judged: a prefix with no lines fails", result[0], "fail")
+        expect("its detail is FileCheck's (`not` command)",
+               "no check strings found with prefix" in result[1], True)
+        none = parse_run("%mojo %s | FileCheck %s --check-prefix=NONE")
+        result = judge_step(other, none, 0, merged.stdout, merged.stdout)
+        expect("judged: a plain command's prefix with no lines fails",
+               result[0], "fail")
+        expect("its detail is FileCheck's (plain command)",
+               "no check strings found with prefix" in result[1], True)
+        expect("copts' defines", copt_defines(
+            ["--ignore-deprecated=X", "-D", "A=1", "-DB=2", "-Werror"]),
+               ["-D", "A=1", "-D", "B=2"])
+    print("self-test: " + ("all ok" if not failures else f"{failures} failed"))
+    return 1 if failures else 0
+
+
+def filecheck(test, stdout, prefix="CHECK", required=False):
+    """FileCheck's complaint about `stdout` with `prefix`, or "" if it passed
+    or `test` has no `prefix` lines. With `required` (a RUN command that pipes
+    to FileCheck), FileCheck runs even then and, as under lit, fails with "no
+    check strings found with prefix"."""
+    source = source_path(test)
+    with open(source) as f:
+        if not required and not re.search(r"^\s*# " + re.escape(prefix)
+                         + r"(-LABEL|-NEXT|-SAME|-DAG|-EMPTY)?:", f.read(),
+                         re.MULTILINE):
+            return ""
+    done = subprocess.run([FILECHECK, source, f"--check-prefix={prefix}"],
+                          input=stdout, capture_output=True, text=True)
+    return done.stderr if done.returncode else ""
+
+
+def save(test, text):
+    if LOGS:
+        with open(os.path.join(LOGS, test.replace("/", "_") + ".log"), "w") as f:
+            f.write(text)
+
+
+def main():
+    global LOGS, LOGS_ALL, DEFINES, ACCELERATOR
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("-j", "--jobs", type=int, default=4)
+    parser.add_argument("-k", "--filter", action="append", default=[],
+                        help="run tests whose path contains this; repeatable")
+    parser.add_argument("-o", "--table", default="")
+    parser.add_argument("--limit", type=int, default=1200,
+                        help="seconds per test, compile included")
+    parser.add_argument("--logs", default="",
+                        help="directory for the output of each failure")
+    parser.add_argument("--logs-all", action="store_true",
+                        help="with --logs, also save the output of each "
+                        "test that passed")
+    parser.add_argument("--expect", default="",
+                        help="expected results to compare with")
+    parser.add_argument("--accelerator", default=ACCELERATOR,
+                        help="the --target-accelerator of every test "
+                        "(default intel:bmg-g31)")
+    parser.add_argument("--self-test", action="store_true",
+                        help="check the judging of tests expected not to "
+                        "compile, without Mojo or the GPU, and exit")
+    args = parser.parse_args()
+    if args.self_test:
+        return self_test()
+    ACCELERATOR = args.accelerator
+    LOGS = args.logs
+    LOGS_ALL = args.logs_all
+    if LOGS:
+        os.makedirs(LOGS, exist_ok=True)
+    includes = include_dirs()
+    DEFINES = bazel_defines()
+    for test, defines in sorted(DEFINES.items()):
+        print(f"Bazel defines for {test}: {' '.join(defines)}")
+    tests = []
+    for d in DIRS:
+        for root, _, files in os.walk(os.path.join(MODULAR, d)):
+            for f in files:
+                if f.endswith(".mojo") and f.startswith("test"):
+                    path = os.path.relpath(os.path.join(root, f), MODULAR)
+                    if not args.filter or any(k in path for k in args.filter):
+                        tests.append(path)
+    for path in LINALG_TESTS:
+        if not args.filter or any(k in path for k in args.filter):
+            tests.append(path)
+    tests.sort()
+    run_start = time.time()
+    with ThreadPoolExecutor(args.jobs) as pool:
+        results = list(pool.map(lambda t: run_one(t, includes, args.limit),
+                                [t for t in tests if t not in FAULTING]))
+    for test in tests:
+        if test in FAULTING:
+            results.append(run_one(test, includes, args.limit))
+            # Whether or not the kernel log shows a fault: when it can't be
+            # read (kernel_faults returns []), a fault would go unseen.
+            absorb_fault()
+    results.sort()
+    faults = kernel_faults(run_start)
+    notes = {}
+    for fault in faults:
+        during = [r[0] for r in results if r[4] <= fault <= r[4] + r[3]]
+        print(f"GPU fault at {time.strftime('%H:%M:%S', time.localtime(fault))}"
+              f" during: {', '.join(during) or 'no test'}")
+    if faults:
+        for i, r in enumerate(results):
+            if r[1] == "timeout" and r[4] + r[3] >= faults[0]:
+                absorb_fault()
+                again = run_one(r[0], includes, args.limit)
+                if again[1] != r[1]:
+                    notes[r[0]] = f"stranded: {r[1]}, then {again[1]} alone"
+                    results[i] = again
+    counts = {}
+    lines = ["| Test | Result | Seconds | First error |", "|---|---|---|---|"]
+    for test, result, why, seconds, _ in results:
+        counts[result] = counts.get(result, 0) + 1
+        if test in notes:
+            why = f"{notes[test]}; {why}" if why else notes[test]
+        why = why.replace("|", "\\|")[:220]
+        lines.append(f"| `{test}` | {result} | {seconds:.0f} | {why} |")
+        if result not in ("pass", "n/a") or test in notes:
+            print(f"{result.upper():8} {test}: {why}")
+    summary = ", ".join(f"{k} {v}" for k, v in sorted(counts.items()))
+    total = sum(r[3] for r in results)
+    print(f"{len(results)} tests: {summary}; {total:.0f} s of test time")
+    if args.table:
+        with open(args.table, "w") as f:
+            f.write(f"{len(results)} tests: {summary}; {total:.0f} s of test "
+                    "time\n\n" + "\n".join(lines) + "\n")
+    if not args.expect:
+        return 0 if counts.get("pass", 0) + counts.get("n/a", 0) == len(
+            results) else 1
+    expected = read_expected(args.expect)
+    worse = 0
+    changes = {}
+    for test, result, _, _, _ in results:
+        if test not in expected:
+            change = "new"
+        else:
+            before = expected[test][0]
+            if before == result:
+                continue
+            change = ("better" if result == "pass" else
+                      "worse" if before == "pass" else "changed")
+        worse += change == "worse"
+        changes[change] = changes.get(change, 0) + 1
+        was = expected.get(test, ("-", ""))[0]
+        print(f"{change.upper():8} {test}: {was} -> {result}")
+    print("against " + args.expect + ": " + (", ".join(
+        f"{k} {v}" for k, v in sorted(changes.items())) or "all the same"))
+    return 1 if worse else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

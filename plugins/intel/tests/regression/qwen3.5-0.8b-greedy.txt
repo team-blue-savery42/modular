@@ -1,0 +1,4 @@
+prompt 0: 64 tokens: 'Thinking Process:\n\n1.  **Analyze the Request:**\n    *   Input: "The capital of France is"\n    *   Intent: The user is asking for the capital city of France.\n   '
+prompt 1: 64 tokens: "Here's a thinking process that leads to the story above:\n\n1.  **Analyze the Request:**\n    *   **Topic:** A lighthouse keeper finds a message in a bottle.\n    *"
+prompt 2: 64 tokens: "Here's a thinking process that leads to the explanation of how a CPU executes a branch instruction:\n\n1.  **Deconstruct the Request:**\n    *   **Topic:** CPU exe"
+prompt 3: 64 tokens: 'Thinking Process:\n\n1.  **Analyze the Request:**\n    *   Task: List ten prime numbers.\n    *   Requirement: Explain why each is prime.\n    *   Constraint: The ou'

@@ -147,6 +147,8 @@ convention = "google"
 "*/_core/*.pyi" = ["D200", "D212", "D418", "PYI001"]
 # Ignore type annotations for the llm-book tutorial files
 "oss/llm-book/**/*.py" = ["ANN001", "ANN201", "ANN202"]
+# Test and benchmark scripts of the Intel plugins, run outside Bazel
+"plugins/intel/{tests,utils}/**/*.py" = ["ANN001", "ANN201", "ANN202"]
 # Ignore type annotations, intentional math unicode (×), and common tutorial code patterns
 # in mojo-gpu-puzzles (external code with its own linting standards)
 "oss/mojo-gpu-puzzles/**/*.py" = ["ANN001", "ANN201", "ANN202", "ANN205", "ANN206", "RUF001"]
