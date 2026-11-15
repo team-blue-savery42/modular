@@ -30,6 +30,12 @@ larger M runs `gemm_kernel` with 256 x 256 work-group tiles, or 256 x
 `SMALL_WG_N` when the output has fewer 256 x 256 tiles than the device has
 Xe-cores.
 
+Intel GPUs without DPAS (any other `version`, the integrated Xe-LP and
+Xe-LPG): float16, bfloat16 or float32 A and B of one type, C float32 or that
+type, row-major as above, M > 1, K a multiple of 4 (and N, for B as K x N):
+`simt_kernel_fn`, a float32 shared-memory GEMM (`simt.mojo`). Anything else
+carries on to the GEMV and the naive kernel.
+
 `matmul_f8_dispatch_intel` is the FP8-weight sibling (MAX's static FP8 linear
 layers on Intel, `mo.matmul.weight.only.scaled.float8.intel`): bfloat16 A,
 float8_e4m3fn B^T and a float32 weight scale, C bfloat16 or float32. M <=
@@ -65,6 +71,7 @@ from .matmul import (
     skinny_ks,
     skinny_wide_ks,
 )
+from .simt import SIMT_THREADS, simt_grid, simt_kernel_fn, simt_supported
 
 
 @inline(.always)
@@ -151,6 +158,20 @@ def matmul_dispatch_intel[
         and a.address_space == AddressSpace.GENERIC
         and b.address_space == AddressSpace.GENERIC
     )
+    # Intel GPUs without DPAS (Xe-LP, Xe-LPG): the shared-memory GEMM of
+    # `simt.mojo` for every M above 1 (M = 1 is MAX's GEMV).
+    comptime taken_simt = (
+        info.api == "level_zero"
+        and info.version != "xe2"
+        and (
+            a_type == DType.float16
+            or a_type == DType.bfloat16
+            or a_type == DType.float32
+        )
+        and b.dtype == a_type
+        and (c_type == DType.float32 or c_type == a_type)
+        and generic
+    )
     comptime taken = (
         info.api == "level_zero"
         and info.version == "xe2"
@@ -160,7 +181,39 @@ def matmul_dispatch_intel[
         and (c_type == DType.float32 or c_type == a_type)
         and generic
     )
-    comptime if not taken:
+    comptime if taken_simt:
+        var m = Int(c.dim[0]())
+        var n = Int(c.dim[1]())
+        var k = Int(a.dim[1]())
+        if not (
+            simt_supported(m, n, k, transpose_b)
+            and (has_epilogue_fn or _row_major(c))
+            and _row_major(a)
+            and _row_major(b)
+        ):
+            return False
+        comptime kern = simt_kernel_fn[
+            a_type,
+            c_type,
+            EpilogueFnType,
+            ComputeFnType,
+            transpose_b,
+            has_epilogue_fn,
+            has_compute_fn,
+        ]
+        ctx.enqueue_function[kern](
+            _raw(c),
+            _raw(a),
+            _raw(b),
+            Int64(m),
+            Int64(n),
+            Int64(k),
+            host_args=(epilogue_fn, compute_fn),
+            grid_dim=simt_grid(m, n),
+            block_dim=SIMT_THREADS,
+        )
+        return True
+    elif not taken:
         return False
     else:
         var m = Int(c.dim[0]())
