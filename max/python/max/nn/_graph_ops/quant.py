@@ -26,8 +26,10 @@ from max.nn._graph_ops import (
     _fused_qkv_ragged_matmul_scaled_mxfp6,
     _fused_qkv_ragged_matmul_scaled_mxfp8,
     _grouped_matmul_rowwise_dynamic_scaled_fp8,
+    _intel_weight_only_scaled_float8_matmul,
     _is_amd_gpu,
     _is_apple_gpu,
+    _is_intel_xe2_gpu,
     block_scales_interleave,
     convert_weights_to_fp8_fnuz_if_needed,
     dynamic_block_scaled_matmul,
@@ -445,6 +447,23 @@ def _matmul_float8(
         # matmul BEFORE the scale multiply (folding a bf16-rounded product would
         # lose mantissa bits). Mirrors the NVFP4 `weight_scale_2` fold.
         return (res * weight_scale.to(res.device)).cast(DType.bfloat16)
+
+    if (
+        x.device.is_gpu()
+        and _is_intel_xe2_gpu()
+        and x.dtype == DType.bfloat16
+        and weight.dtype == DType.float8_e4m3fn
+        and x_scales is None
+        and quant_config.weight_scale.is_tensor
+        and weight_scale.shape in ([], [1])
+    ):
+        # Intel Xe2 weight-only (W8A16) path, as Apple's above: Xe2's DPAS has
+        # no FP8 type, so the activation stays bf16 and the kernel widens the
+        # FP8 weight in registers. The per-tensor `weight_scale` multiplies
+        # the float32 accumulators in the kernel; `input_scale` cancels for a
+        # bf16 activation. Gated on the Level Zero API: no other target
+        # changes.
+        return _intel_weight_only_scaled_float8_matmul(x, weight, weight_scale)
 
     weight, weight_scale = convert_weights_to_fp8_fnuz_if_needed(
         weight, weight_scale
