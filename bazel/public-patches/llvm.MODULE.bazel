@@ -27,6 +27,11 @@ llvm_source.configure(
         # passed to OpenCL printf (an assertion, or an out-of-range read).
         # Found by the Intel plugin; not yet reported upstream.
         "//bazel/public-patches:llvm-spirv-variadic-constant-ptr-arg.patch",
+        # The SPIR-V backend treats the arbitrary-precision-integers capability
+        # (i128 and other widths) as implying Int8 and Int16 and leaves them
+        # out; spirv-val requires them declared. Declare them explicitly,
+        # which IGC accepts too. Not yet reported upstream.
+        "//bazel/public-patches:llvm-spirv-arbitrary-precision-explicit-int8.patch",
         # libLLVM (llvm-shared.patch) whole-archives only its direct deps, and
         # nothing in it calls SPIRVTranslateModule, which also lacked LLVM_ABI
         # (hidden in libLLVM); so with the SPIR-V target
