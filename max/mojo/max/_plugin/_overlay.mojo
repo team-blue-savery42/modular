@@ -21,6 +21,7 @@ from std._gpu.host.info import TargetAcceleratorCollection
 from ._trait import DefaultTargets, MaxPlugin
 from .cuda.targets import CudaTargets
 from .hip.targets import HipTargets
+from .intel.targets import IntelTargets
 from .metal.targets import MetalTargets
 
 # Builtin targets carry their MAX plugin in their payload, so this lists none
@@ -35,5 +36,6 @@ comptime TARGETS = TypeList.of[
     DefaultTargets,
     CudaTargets,
     HipTargets,
+    IntelTargets,
     MetalTargets,
 ]()
