@@ -385,6 +385,48 @@ trait MaxPluginHooks:
         return matched if matched == active else Scalar[mask_type](0)
 
     @staticmethod
+    def mma_fn[
+        d_dtype: DType,
+        d_width: SIMDLength,
+        a_dtype: DType,
+        a_width: SIMDLength,
+        b_dtype: DType,
+        b_width: SIMDLength,
+        c_dtype: DType,
+        c_width: SIMDLength,
+        //,
+    ](
+        mut d: SIMD[d_dtype, d_width],
+        a: SIMD[a_dtype, a_width],
+        b: SIMD[b_dtype, b_width],
+        c: SIMD[c_dtype, c_width],
+    ):
+        """Lowers `mma()` on a target `mma()` doesn't name: `d = a * b + c`
+        over the warp's fragments of the matrices.
+
+        The fragment shapes and types are the target's, so a plugin documents
+        its own and rejects the others at compile time. A target that doesn't
+        override it rejects `mma()` at compile time.
+
+        Parameters:
+            d_dtype: The element type of the result.
+            d_width: The number of result elements each lane holds.
+            a_dtype: The element type of A.
+            a_width: The number of A elements each lane holds.
+            b_dtype: The element type of B.
+            b_width: The number of B elements each lane holds.
+            c_dtype: The element type of the accumulator.
+            c_width: The number of accumulator elements each lane holds.
+
+        Args:
+            d: The calling lane's fragment of the result.
+            a: The calling lane's fragment of A.
+            b: The calling lane's fragment of B.
+            c: The calling lane's fragment of the accumulator.
+        """
+        CompilationTarget.unsupported_target_error[operation="mma"]()
+
+    @staticmethod
     def enqueue_function_fn[
         *Ts: DevicePassable
     ](
