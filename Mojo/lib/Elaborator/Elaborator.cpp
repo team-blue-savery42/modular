@@ -123,9 +123,14 @@ ImplNode::ImplNode(ParamNode *parent)
 
 void ImplNode::setToError(ErrorTree &&err) {
   if (error) {
+    // A node can fail twice, for example when a constraint fails while its
+    // error is being reported. Keep the first error, which explains the
+    // failure and is emitted with the rest; aborting here lost it (the
+    // diagnostics are buffered), and is undefined behavior in release builds.
 #ifndef MODULAR_PRODUCTION
     std::lock_guard<std::mutex> guard(getGlobalMutex());
-    llvm::errs() << "INTERNAL ELABORATOR ERROR PROCESSING: ";
+    llvm::errs() << "note: elaborator node already has an error; keeping the "
+                    "first, in ";
     if (parent && parent->gen)
       llvm::errs() << parent->getMangledName().strref();
     else if (inst)
@@ -133,19 +138,8 @@ void ImplNode::setToError(ErrorTree &&err) {
     else
       llvm::errs() << "[ROOT NODE]";
     llvm::errs() << "\n";
-
-    ErrorLimit errorLimit{this->getEvaluator().getErrorLimit(), 0};
-
-    emitLimitedError(
-        [&] {
-          return std::move(*error).emit(
-              [](Location loc) { return mlir::emitError(loc); }, "HERE",
-              this->getEvaluator().getElabErrorIncludePrelude());
-        },
-        errorLimit);
-
 #endif // MODULAR_PRODUCTION
-    llvm_unreachable("impl node already has an error");
+    return;
   }
   hasError.store(true);
   error = std::move(err);
