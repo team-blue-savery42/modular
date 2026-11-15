@@ -626,7 +626,7 @@ M_driver_queue_execute(M_driver_queue_t queue, M_driver_function_t function,
   std::lock_guard<std::mutex> queueLock(queue->mutex);
   M::Intel::Profiling::QueueProfile *profile = queue->profile.get();
   ze_event_handle_t signal =
-      profile != nullptr ? profile->nextEvent() : nullptr;
+      profile != nullptr && !queue->capturing ? profile->nextEvent() : nullptr;
   ze_result_t result = api.zeCommandListAppendLaunchKernel(
       queue->list, function->kernel, &groups, signal, 0, nullptr);
   if (result != ZE_RESULT_SUCCESS) {

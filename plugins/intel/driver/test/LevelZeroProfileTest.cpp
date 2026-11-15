@@ -19,6 +19,10 @@
 
 #include "Target/test/Fixture.h"
 
+#include "plugins/intel/driver/IntelGraphs.h"
+
+#include <dlfcn.h>
+
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
@@ -94,6 +98,29 @@ TEST_F(ProfileTest, LaunchesCopiesAndSynchronizesAreRecorded) {
   ASSERT_SUCCESS(queue_synchronize(queue));
   EXPECT_EQ(host[0], 32.0f); // doubled five times
 
+  // A device graph of three launches (IntelGraphs.h), launched twice: its
+  // captured kernels are `k` records, each launch a `G` with device times.
+  auto begin = reinterpret_cast<M_driver_intel_graph_capture_begin_func_ptr_t>(
+      dlsym(soHandle, "M_driver_intel_graph_capture_begin"));
+  auto end = reinterpret_cast<M_driver_intel_graph_capture_end_func_ptr_t>(
+      dlsym(soHandle, "M_driver_intel_graph_capture_end"));
+  auto launchGraph = reinterpret_cast<M_driver_intel_graph_launch_func_ptr_t>(
+      dlsym(soHandle, "M_driver_intel_graph_launch"));
+  auto destroyGraph = reinterpret_cast<M_driver_intel_graph_destroy_func_ptr_t>(
+      dlsym(soHandle, "M_driver_intel_graph_destroy"));
+  ASSERT_NE(begin, nullptr);
+  constexpr int kCaptured = 3, kGraphLaunches = 2;
+  ASSERT_SUCCESS(begin(queue));
+  for (int i = 0; i < kCaptured; ++i)
+    ASSERT_SUCCESS(queue_execute(queue, function, &config, args, sizes, 4));
+  M_driver_intel_graph_t graph = nullptr;
+  ASSERT_SUCCESS(end(queue, &graph));
+  for (int i = 0; i < kGraphLaunches; ++i)
+    ASSERT_SUCCESS(launchGraph(queue, graph));
+  ASSERT_SUCCESS(queue_copy_from_device(queue, host.data(), &view));
+  ASSERT_SUCCESS(queue_synchronize(queue));
+  EXPECT_EQ(host[0], 32.0f * 64.0f); // six more doublings
+  ASSERT_SUCCESS(destroyGraph(graph));
   ASSERT_SUCCESS(queue_destroy(contexts[0], queue));
   ASSERT_SUCCESS(memory_free_sync(contexts[0], memory));
   ASSERT_SUCCESS(function_unload(contexts[0], function));
@@ -102,6 +129,7 @@ TEST_F(ProfileTest, LaunchesCopiesAndSynchronizesAreRecorded) {
   std::ifstream profile(prefix() + "." + std::to_string(getpid()));
   ASSERT_TRUE(profile.good());
   int kernels = 0, copies = 0, syncs = 0, names = 0, header = 0, allocs = 0;
+  int captured = 0, graphLaunches = 0;
   std::string line;
   while (std::getline(profile, line)) {
     std::istringstream fields(line);
@@ -126,6 +154,22 @@ TEST_F(ProfileTest, LaunchesCopiesAndSynchronizesAreRecorded) {
       EXPECT_GE(start, 0);
       EXPECT_GT(end, start);
       ++kernels;
+    } else if (kind == "k") {
+      unsigned q, g, f, gx;
+      fields >> q >> g >> f >> gx;
+      EXPECT_GT(g, 0u);
+      EXPECT_EQ(gx, n / 256);
+      ++captured;
+    } else if (kind == "G") {
+      unsigned q, g;
+      unsigned long long enter, exit;
+      long long start, end;
+      fields >> q >> g >> enter >> exit >> start >> end;
+      EXPECT_GT(g, 0u);
+      EXPECT_LE(enter, exit);
+      EXPECT_GE(start, 0);
+      EXPECT_GT(end, start);
+      ++graphLaunches;
     } else if (kind == "C") {
       ++copies;
     } else if (kind == "S") {
@@ -137,7 +181,9 @@ TEST_F(ProfileTest, LaunchesCopiesAndSynchronizesAreRecorded) {
   EXPECT_EQ(header, 1);
   EXPECT_EQ(names, 1);
   EXPECT_EQ(kernels, kLaunches);
-  EXPECT_EQ(copies, 2);
+  EXPECT_EQ(captured, kCaptured);
+  EXPECT_EQ(graphLaunches, kGraphLaunches);
+  EXPECT_EQ(copies, 3);
   EXPECT_GE(syncs, 1);
   EXPECT_GE(allocs, 1);
 }

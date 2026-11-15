@@ -78,7 +78,13 @@
   X(zeDeviceGetModuleProperties)                                               \
   X(zeDeviceGetCacheProperties)                                                \
   X(zeEventQueryKernelTimestamp)                                               \
-  X(zeDeviceGetGlobalTimestamps)
+  X(zeDeviceGetGlobalTimestamps)                                               \
+  X(zeCommandListBeginGraphCaptureExt)                                         \
+  X(zeCommandListEndGraphCaptureExt)                                           \
+  X(zeGraphInstantiateExt)                                                     \
+  X(zeCommandListAppendGraphExt)                                               \
+  X(zeExecutableGraphDestroyExt)                                               \
+  X(zeGraphDestroyExt)
 
 /// Sysman entry points, used only for free-memory queries; may be missing.
 #define MOJO_INTEL_ZES_OPTIONAL(X)                                             \

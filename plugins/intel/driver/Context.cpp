@@ -23,6 +23,7 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "IntelGraphs.h"
 #include "Plugin.h"
 
 #include <algorithm>
@@ -421,6 +422,10 @@ M_driver_status_t allocateUntimed(M_driver_context_t context, uint64_t size,
 void reclaimCompletedFrees(M_driver_context &context);
 
 M_driver_memory *takePendingFree(M_driver_context &context, uint64_t capacity);
+M_driver_memory *takeGraphPool(M_driver_context &context, uint64_t capacity,
+                               bool host);
+M_driver_status_t releaseGraphPoolIfUnused(M_driver_context &context);
+bool capturing(M_driver_context &context);
 
 M_driver_status_t allocate(M_driver_context_t context, uint64_t size, bool host,
                            M_driver_memory_t *memory) {
@@ -449,6 +454,13 @@ M_driver_status_t allocateUntimed(M_driver_context_t context, uint64_t size,
     return M_DRIVER_STATUS_SUCCESS;
   }
   uint64_t capacity = capacityFor(size);
+  if (M_driver_memory *pooled = takeGraphPool(*context, capacity, host)) {
+    pooled->size = size;
+    pooled->graphOwned = true;
+    *memory = pooled;
+    *cached = true;
+    return M_DRIVER_STATUS_SUCCESS;
+  }
   void *ptr = takeCached(*context, capacity, host);
   if (ptr == nullptr && cacheLimit() != 0) {
     reclaimCompletedFrees(*context);
@@ -505,6 +517,7 @@ M_driver_status_t allocateUntimed(M_driver_context_t context, uint64_t size,
   handle->capacity = capacity;
   handle->host = host;
   handle->counted = !host;
+  handle->graphOwned = capturing(*context);
   *memory = handle.release();
   return M_DRIVER_STATUS_SUCCESS;
 }
@@ -616,6 +629,13 @@ M_driver_status_t M_driver_context_destroy(M_driver_context_t context) {
   // abort flag and the heap through module globals: both are freed only
   // once those queues are idle.
   drainQueues(*owned);
+  {
+    // Graphs the caller didn't destroy: their pool goes with the context.
+    std::lock_guard<std::mutex> lock(owned->captureMutex);
+    owned->liveGraphs = 0;
+    owned->capturing = 0;
+  }
+  releaseGraphPoolIfUnused(*owned);
   flushCache(*owned);
   api.zeMemFree(owned->zeContext, owned->abortFlag);
   if (owned->heap != nullptr) {
@@ -884,7 +904,65 @@ M_driver_driver &driverOf(const M_driver_queue &queue) {
 /// The timestamp event for the next command on `queue` when profiling, else
 /// null. Caller holds `queue.mutex`.
 ze_event_handle_t profileEvent(M_driver_queue &queue) {
-  return queue.profile != nullptr ? queue.profile->nextEvent() : nullptr;
+  // A captured command can't signal an event the host harvests.
+  return queue.profile != nullptr && !queue.capturing
+             ? queue.profile->nextEvent()
+             : nullptr;
+}
+
+/// Whether a queue of `context` captures.
+bool capturing(M_driver_context &context) {
+  std::lock_guard<std::mutex> lock(context.captureMutex);
+  return context.capturing != 0;
+}
+
+/// While a queue of `context` captures, or while a graph lives for memory
+/// allocated during a capture, puts `memory` in the graph pool
+/// (IntelGraphs.h) and returns true: the graph's launches reuse the
+/// addresses the captured work saw, its outputs among them, which MAX
+/// frees after the capture, so only later captures may reuse it.
+bool keepForCapture(M_driver_context &context, M_driver_memory *memory) {
+  std::lock_guard<std::mutex> lock(context.captureMutex);
+  if (context.capturing == 0 &&
+      !(memory->graphOwned && context.liveGraphs != 0))
+    return false;
+  context.graphPool.emplace(memory->capacity, memory);
+  return true;
+}
+
+/// A pooled block of `capacity` for an allocation made while a queue
+/// captures, or null.
+M_driver_memory *takeGraphPool(M_driver_context &context, uint64_t capacity,
+                               bool host) {
+  std::lock_guard<std::mutex> lock(context.captureMutex);
+  if (context.capturing == 0)
+    return nullptr;
+  auto [begin, end] = context.graphPool.equal_range(capacity);
+  for (auto it = begin; it != end; ++it) {
+    if (it->second->host != host)
+      continue;
+    M_driver_memory *memory = it->second;
+    context.graphPool.erase(it);
+    return memory;
+  }
+  return nullptr;
+}
+
+/// Releases the graph pool once no graph lives and no queue captures.
+M_driver_status_t releaseGraphPoolIfUnused(M_driver_context &context) {
+  std::multimap<uint64_t, M_driver_memory *> pool;
+  {
+    std::lock_guard<std::mutex> lock(context.captureMutex);
+    if (context.liveGraphs != 0 || context.capturing != 0)
+      return M_DRIVER_STATUS_SUCCESS;
+    pool.swap(context.graphPool);
+  }
+  M_driver_status_t first = M_DRIVER_STATUS_SUCCESS;
+  for (auto &[capacity, memory] : pool)
+    if (M_driver_status_t status = release(&context, memory);
+        status != M_DRIVER_STATUS_SUCCESS && first == M_DRIVER_STATUS_SUCCESS)
+      first = status;
+  return first;
 }
 
 /// Gives back the timestamp event `profileEvent` handed out when the command
@@ -1138,6 +1216,9 @@ M_driver_status_t markLocked(M_driver_queue &queue, bool *wait) {
 /// so the memory is never leaked. Caller holds `queue.mutex`.
 M_driver_status_t releaseWhenDoneLocked(M_driver_queue &queue,
                                         M_driver_memory *memory) {
+  if (memory != nullptr && memory->owning &&
+      keepForCapture(*queue.context, memory))
+    return M_DRIVER_STATUS_SUCCESS;
   bool wait = false;
   if (M_driver_status_t status = markLocked(queue, &wait)) {
     release(queue.context, memory);
@@ -1164,6 +1245,9 @@ M_driver_status_t checkAbort(M_driver_context &context) {
 /// happens outside `queue.mutex`, so other threads keep appending meanwhile.
 M_driver_status_t hostSynchronize(M_driver_queue &queue) {
   std::unique_lock<std::mutex> lock(queue.mutex);
+  if (queue.capturing)
+    return fail(driverOf(queue), "queue_synchronize on a queue that captures "
+                                 "a graph: its work hasn't run");
   if (queue.syncEvent == nullptr) {
     if (M_driver_status_t status = waitList(queue))
       return status;
@@ -1231,6 +1315,8 @@ M_driver_status_t releaseAfterQueues(M_driver_context_t context,
     return M_DRIVER_STATUS_BAD_CONTEXT;
   if (memory == nullptr || !memory->owning)
     return release(context, memory);
+  if (keepForCapture(*context, memory))
+    return M_DRIVER_STATUS_SUCCESS;
   if (debugDrainFrees()) {
     M_driver_status_t drained = drainQueues(*context);
     M_driver_status_t status = release(context, memory);
@@ -1678,4 +1764,173 @@ M_driver_status_t M_driver_is_event_ready(M_driver_context_t context,
     return M_DRIVER_STATUS_SUCCESS;
   }
   return failZe(driverOf(*context), "zeEventQueryStatus", result);
+}
+
+// ===-- Graphs (IntelGraphs.h) --------------------------------------------===
+
+struct M_driver_intel_graph_s {
+  M_driver_context *context = nullptr;
+  ze_graph_handle_t graph = nullptr;
+  ze_executable_graph_handle_t executable = nullptr;
+  /// The graph's id in the launch profile (MOJO_INTEL_PROFILE); 0 when off.
+  uint32_t profileId = 0;
+};
+
+namespace {
+
+bool hasGraphCapture(const M_driver_device &device) {
+  const ZeApi &api = *device.driver->ze;
+  if (api.zeCommandListBeginGraphCaptureExt == nullptr ||
+      api.zeCommandListEndGraphCaptureExt == nullptr ||
+      api.zeGraphInstantiateExt == nullptr ||
+      api.zeCommandListAppendGraphExt == nullptr ||
+      api.zeExecutableGraphDestroyExt == nullptr ||
+      api.zeGraphDestroyExt == nullptr ||
+      api.zeDriverGetExtensionProperties == nullptr)
+    return false;
+  uint32_t count = 0;
+  if (api.zeDriverGetExtensionProperties(device.zeDriver, &count, nullptr) !=
+      ZE_RESULT_SUCCESS)
+    return false;
+  std::vector<ze_driver_extension_properties_t> props(count);
+  if (api.zeDriverGetExtensionProperties(device.zeDriver, &count,
+                                         props.data()) != ZE_RESULT_SUCCESS)
+    return false;
+  for (const ze_driver_extension_properties_t &p : props)
+    if (std::strcmp(p.name, ZE_RECORD_REPLAY_GRAPH_EXT_NAME) == 0)
+      return p.version >= ZE_RECORD_REPLAY_GRAPH_EXT_VERSION_1_0;
+  return false;
+}
+
+/// Ends the context's capture count for one queue, whose graph now lives.
+void endCaptureCount(M_driver_context &context) {
+  std::lock_guard<std::mutex> lock(context.captureMutex);
+  --context.capturing;
+  ++context.liveGraphs;
+}
+
+} // namespace
+
+M_driver_status_t M_driver_intel_graphs_version(M_driver_device_t device,
+                                                uint32_t *version) {
+  if (device == nullptr)
+    return M_DRIVER_STATUS_BAD_DEVICE;
+  if (version == nullptr)
+    return M_DRIVER_STATUS_INVALID_ARG;
+  *version = hasGraphCapture(*device) ? M_DRIVER_INTEL_GRAPHS_VERSION_1 : 0;
+  return M_DRIVER_STATUS_SUCCESS;
+}
+
+M_driver_status_t M_driver_intel_graph_capture_begin(M_driver_queue_t queue) {
+  if (queue == nullptr)
+    return M_DRIVER_STATUS_BAD_QUEUE;
+  if (!hasGraphCapture(*queue->context->device))
+    return M_DRIVER_STATUS_UNSUPPORTED;
+  std::lock_guard<std::mutex> lock(queue->mutex);
+  if (queue->capturing)
+    return M_DRIVER_STATUS_INVALID_ARG;
+  ze_result_t result =
+      ze(*queue).zeCommandListBeginGraphCaptureExt(queue->list, nullptr);
+  if (result != ZE_RESULT_SUCCESS)
+    return failZe(driverOf(*queue), "zeCommandListBeginGraphCaptureExt",
+                  result);
+  queue->capturing = true;
+  if (queue->profile != nullptr)
+    queue->profile->beginCapture(Profiling::QueueProfile::nextGraphId());
+  std::lock_guard<std::mutex> captureLock(queue->context->captureMutex);
+  ++queue->context->capturing;
+  return M_DRIVER_STATUS_SUCCESS;
+}
+
+M_driver_status_t
+M_driver_intel_graph_capture_end(M_driver_queue_t queue,
+                                 M_driver_intel_graph_t *graph) {
+  if (queue == nullptr)
+    return M_DRIVER_STATUS_BAD_QUEUE;
+  if (graph == nullptr)
+    return M_DRIVER_STATUS_INVALID_ARG;
+  *graph = nullptr;
+  auto made = std::make_unique<M_driver_intel_graph_s>();
+  made->context = queue->context;
+  const ZeApi &api = ze(*queue);
+  {
+    std::lock_guard<std::mutex> lock(queue->mutex);
+    if (!queue->capturing)
+      return M_DRIVER_STATUS_INVALID_ARG;
+    ze_result_t result =
+        api.zeCommandListEndGraphCaptureExt(queue->list, nullptr, &made->graph);
+    queue->capturing = false;
+    if (queue->profile != nullptr) {
+      made->profileId = queue->profile->capturingGraph();
+      queue->profile->endCapture();
+    }
+    endCaptureCount(*queue->context);
+    if (result != ZE_RESULT_SUCCESS) {
+      // The kept memory may still be used by work recorded before the
+      // failure; leave it to the destroy, which waits first.
+      M_driver_status_t status =
+          failZe(driverOf(*queue), "zeCommandListEndGraphCaptureExt", result);
+      M_driver_intel_graph_destroy(made.release());
+      return status;
+    }
+  }
+  ze_result_t result =
+      api.zeGraphInstantiateExt(made->graph, nullptr, &made->executable);
+  if (result != ZE_RESULT_SUCCESS) {
+    M_driver_status_t status =
+        failZe(driverOf(*queue), "zeGraphInstantiateExt", result);
+    M_driver_intel_graph_destroy(made.release());
+    return status;
+  }
+  *graph = made.release();
+  return M_DRIVER_STATUS_SUCCESS;
+}
+
+M_driver_status_t M_driver_intel_graph_launch(M_driver_queue_t queue,
+                                              M_driver_intel_graph_t graph) {
+  if (queue == nullptr)
+    return M_DRIVER_STATUS_BAD_QUEUE;
+  if (graph == nullptr || graph->executable == nullptr ||
+      graph->context != queue->context)
+    return M_DRIVER_STATUS_INVALID_ARG;
+  uint64_t enter = queue->profile != nullptr ? Profiling::now() : 0;
+  std::lock_guard<std::mutex> lock(queue->mutex);
+  // The whole graph signals one timestamp event: its device time.
+  ze_event_handle_t signal = profileEvent(*queue);
+  ze_result_t result = ze(*queue).zeCommandListAppendGraphExt(
+      queue->list, graph->executable, nullptr, signal, 0, nullptr);
+  if (result != ZE_RESULT_SUCCESS) {
+    abandonProfileEvent(*queue);
+    return failZe(driverOf(*queue), "zeCommandListAppendGraphExt", result);
+  }
+  ++queue->appended;
+  if (queue->profile != nullptr)
+    queue->profile->graphLaunch(graph->profileId, enter, Profiling::now());
+  return M_DRIVER_STATUS_SUCCESS;
+}
+
+M_driver_status_t M_driver_intel_graph_destroy(M_driver_intel_graph_t graph) {
+  if (graph == nullptr)
+    return M_DRIVER_STATUS_SUCCESS;
+  std::unique_ptr<M_driver_intel_graph_s> owned(graph);
+  M_driver_context &context = *graph->context;
+  const ZeApi &api = ze(context);
+  // A launch of the graph may still be running on any queue.
+  M_driver_status_t first = drainQueues(context);
+  auto note = [&](M_driver_status_t status) {
+    if (status != M_DRIVER_STATUS_SUCCESS && first == M_DRIVER_STATUS_SUCCESS)
+      first = status;
+  };
+  if (graph->executable != nullptr)
+    if (ze_result_t r = api.zeExecutableGraphDestroyExt(graph->executable))
+      note(failZe(driverOf(context), "zeExecutableGraphDestroyExt", r));
+  if (graph->graph != nullptr)
+    if (ze_result_t r = api.zeGraphDestroyExt(graph->graph))
+      note(failZe(driverOf(context), "zeGraphDestroyExt", r));
+  {
+    std::lock_guard<std::mutex> lock(context.captureMutex);
+    --context.liveGraphs;
+  }
+  note(releaseGraphPoolIfUnused(context));
+  return first;
 }
