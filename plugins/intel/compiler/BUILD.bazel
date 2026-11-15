@@ -28,6 +28,7 @@ modular_cc_library(
         "Convergent.cpp",
         "DynamicSharedMemory.cpp",
         "Heap.cpp",
+        "NestedStructArguments.cpp",
         "PromoteBFloat16.cpp",
         "RemapAddressSpaces.cpp",
         "SPIRVBinary.cpp",
@@ -39,6 +40,7 @@ modular_cc_library(
         "Convergent.h",
         "DynamicSharedMemory.h",
         "Heap.h",
+        "NestedStructArguments.h",
         "PromoteBFloat16.h",
         "RemapAddressSpaces.h",
         "SPIRVBinary.h",
@@ -202,6 +204,18 @@ modular_cc_test(
         "@llvm-project//llvm:Support",
         "@llvm-project//llvm:Target",
         "@llvm-project//llvm:TargetParser",
+    ],
+)
+
+modular_cc_test(
+    name = "NestedStructArgumentsTest",
+    size = "small",
+    srcs = ["test/NestedStructArgumentsTest.cpp"],
+    deps = [
+        ":IntelPasses",
+        "@llvm-project//llvm:AsmParser",
+        "@llvm-project//llvm:Core",
+        "@llvm-project//llvm:Support",
     ],
 )
 
