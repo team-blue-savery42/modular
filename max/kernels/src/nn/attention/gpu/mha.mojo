@@ -2287,6 +2287,7 @@ def flash_attention_dispatch[
                     )
         elif (
             ctx.default_device_info.api == "level_zero"
+            and ctx.default_device_info.version == "xe2"
             and ragged
             and not sink
             and output.dtype == dtype

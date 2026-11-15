@@ -34,6 +34,12 @@ def _clock_hz[target: CompilationTarget]() -> UInt64:
     comptime if target._arch() == "bmg-g21":
         # Arc B580: its rated maximum GPU clock; not measured.
         return 2_850_000_000
+    elif target._arch() == "rpl-p":
+        # Raptor Lake-P integrated GPU: Level Zero's coreClockRate.
+        return 1_250_000_000
+    elif target._arch() == "arl-s":
+        # Arrow Lake-S integrated GPU: Level Zero's coreClockRate.
+        return 1_950_000_000
     else:
         # Arc Pro B70 (bmg-g31): measured.
         return 2_800_000_000
