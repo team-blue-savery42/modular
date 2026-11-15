@@ -1,0 +1,12 @@
+diff --git a/llvm/lib/Target/SPIRV/SPIRVSymbolicOperands.td b/llvm/lib/Target/SPIRV/SPIRVSymbolicOperands.td
+--- a/llvm/lib/Target/SPIRV/SPIRVSymbolicOperands.td
++++ b/llvm/lib/Target/SPIRV/SPIRVSymbolicOperands.td
+@@ -568,7 +568,7 @@
+ defm FragmentDensityEXT : CapabilityOperand<5291, 0, 0, [], [Shader]>;
+ defm PhysicalStorageBufferAddressesEXT : CapabilityOperand<5347, 0, 0, [], [Shader]>;
+ defm CooperativeMatrixNV : CapabilityOperand<5357, 0, 0, [], [Shader]>;
+-defm ArbitraryPrecisionIntegersALTERA : CapabilityOperand<5844, 0, 0, [SPV_ALTERA_arbitrary_precision_integers], [Int8, Int16]>;
++defm ArbitraryPrecisionIntegersALTERA : CapabilityOperand<5844, 0, 0, [SPV_ALTERA_arbitrary_precision_integers], []>;
+ defm OptNoneINTEL : CapabilityOperand<6094, 0, 0, [SPV_INTEL_optnone], []>;
+ defm OptNoneEXT : CapabilityOperand<6094, 0, 0, [SPV_EXT_optnone], []>;
+ defm BitInstructions : CapabilityOperand<6025, 0, 0, [SPV_KHR_bit_instructions], []>;
