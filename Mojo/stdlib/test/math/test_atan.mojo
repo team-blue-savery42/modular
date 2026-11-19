@@ -28,10 +28,23 @@ from std.math.math import _call_libm
 from std.testing import TestSuite, assert_true
 from std.utils.numerics import FPUtils
 
-from test_utils.math import libm_call_binary
+from test_utils.math import libm_call_binary, round_to_bfloat16
 
 comptime log2_10 = 3.321928094887362
 comptime atan2_libm = libm_call_binary["atan2f", "atan2"]
+
+
+def _atan_libm[
+    dtype: DType
+](x: Scalar[dtype]) -> Scalar[dtype] where dtype.is_floating_point():
+    """libm's `atan`; bfloat16 rounds the float32 result with
+    `round_to_bfloat16`, which keeps subnormals on every target."""
+    comptime if dtype == .bfloat16:
+        return rebind[Scalar[dtype]](
+            round_to_bfloat16(_call_libm["atan"](x.cast[.float32]()))
+        )
+    else:
+        return _call_libm["atan"](x)
 
 
 def _ulp_diff[
@@ -189,12 +202,12 @@ def _check_atan[dtype: DType]() raises where dtype.is_floating_point():
     var worst = 0
     for v in _atan_inputs():
         var x = v.cast[dtype]()
-        _check("atan", atan(x), _call_libm["atan"](x), 0.0, v, worst)
+        _check("atan", atan(x), _atan_libm(x), 0.0, v, worst)
     # A SIMD call must agree with the scalar one lane by lane.
     var xs = SIMD[dtype, 4](-3.0, -0.5, 0.25, 7.0)
     var r = atan(xs)
     for i in range(4):
-        _check("atan simd", r[i], _call_libm["atan"](xs[i]), 0.0, 0.0, worst)
+        _check("atan simd", r[i], _atan_libm(xs[i]), 0.0, 0.0, worst)
     print(t"atan {dtype} max ulp vs libm: {worst}")
 
 

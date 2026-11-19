@@ -84,7 +84,7 @@ from std.utils.numerics import (
     nextafter,
 )
 
-from test_utils.math import SplitMix64
+from test_utils.math import SplitMix64, round_to_bfloat16
 
 
 def test_sin() raises:
@@ -624,7 +624,9 @@ def _test_frexp_bits_impl[
 
 
 def test_narrow_f32_to_bf16_bits() raises:
-    # Must agree with the (round-to-nearest-even) `cast`. Every high half
+    # Must round to nearest even, subnormals kept, as `round_to_bfloat16`
+    # does on every target (`cast` flushes subnormals where it is
+    # `vcvtneps2bf16`, on x86 with AVX512-BF16). Every high half
     # covers each sign, exponent, NaN and kept mantissa; the low halves sit
     # at, just below and just above a rounding tie. NaN payloads differ
     # between targets' casts, so a NaN only has to stay a quiet NaN with
@@ -645,7 +647,7 @@ def test_narrow_f32_to_bf16_bits() raises:
             var bits = (UInt32(hi) << 16) | lo
             var x = Float32(from_bits=bits)
             var got = _narrow_f32_to_bf16_bits(x)
-            var want = x.cast[.bfloat16]()
+            var want = round_to_bfloat16(x)
             if isnan(x):
                 var got_bits = got.to_bits[.uint16]()
                 if got_bits & 0xFFC0 != UInt16(hi & 0x8000) | 0x7FC0:

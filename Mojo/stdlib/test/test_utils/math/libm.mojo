@@ -19,6 +19,37 @@ from std.simd import _simd_apply
 from std.sys import CompilationTarget, size_of
 
 
+def round_to_bfloat16(x: Float32) -> BFloat16:
+    """Rounds `x` to bfloat16, to nearest with ties to even, keeping subnormal
+    results.
+
+    `cast[.bfloat16]` compiles to `vcvtneps2bf16` on x86 targets with
+    AVX512-BF16, which flushes subnormal inputs to zero, and keeps them on
+    other targets. This reference gives the same result on every target: a
+    normal input never rounds to a subnormal, so it is cast; a subnormal input
+    is rounded in float64, where bfloat16's subnormals are the integer
+    multiples of 2**-133, which is 2**-16 of float32's mantissa unit.
+
+    Args:
+        x: The value to round.
+
+    Returns:
+        `x` rounded to bfloat16; NaN stays NaN, infinities stay infinite.
+    """
+    var bits = x.to_bits()
+    var mantissa = bits & 0x007FFFFF
+    if bits & 0x7F800000 != 0 or mantissa == 0:
+        return x.cast[.bfloat16]()
+    var scaled = Float64(mantissa) / 65536.0
+    var whole = trunc(scaled)
+    var q = UInt16(Int(whole))
+    var rest = scaled - whole
+    if rest > 0.5 or (rest == 0.5 and q & 1 == 1):
+        q += 1
+    var sign = UInt16(bits >> 16) & 0x8000
+    return BFloat16(from_bits=sign | q)
+
+
 @inline(.always)
 def libm_call[
     dtype: DType,
