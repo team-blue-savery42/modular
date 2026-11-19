@@ -1102,6 +1102,24 @@ def _f4_to_bf16_pairs(
     return (even >> 16) | (odd & 0xFFFF0000)
 
 
+@inline(.always)
+def _f4_word_to_bf16_pairs(
+    word: UInt32, scale: Float32
+) -> SIMD[DType.uint32, 4]:
+    """`_f4_to_bf16_pairs` for one word of 8 E2M1 codes sharing one block
+    scale: the 4 words of bfloat16 pairs of the values times `scale` /
+    2**14 (K order from the low nibble, and the low half)."""
+    comptime shifts = SIMD[DType.uint32, 8](0, 4, 8, 12, 16, 20, 24, 28)
+    var nib = ((SIMD[DType.uint32, 8](word) >> shifts) & 0xF).cast[
+        DType.uint16
+    ]()
+    var h = ((nib & 0x8) << 12) | ((nib & 0x7) << 9)
+    var f = bitcast[DType.float16, 8](h).cast[DType.float32]() * scale
+    var u = bitcast[DType.uint32, 8](f)
+    var even, odd = u.deinterleave()
+    return (even >> 16) | (odd & 0xFFFF0000)
+
+
 comptime F4_K_STEP = 64
 """K per step of the FP4 skinny kernel: one transposed load of 8 words of 8
 E2M1 codes covers 64 values of each B^T row."""
@@ -1243,21 +1261,24 @@ def f4_widen_kernel(
 ):
     """Widens `count` E2M1 values (a multiple of 32, two per byte of `src`,
     with one E4M3 scale per 16 consecutive values in `scales`) to bfloat16
-    values times their scale / 2**22 (`_f4_to_bf16_pairs`), 32 per
-    work-item: launch `ceildiv(count, 32 * block)` work-groups of `block`
+    values times their scale / 2**22. A work-item takes `F4_WIDEN_WORDS`
+    words of 8 codes, a work-group apart, so adjacent work-items read
+    adjacent words and write adjacent 16-byte runs of pairs: launch
+    `ceildiv(count, 8 * F4_WIDEN_WORDS * block)` work-groups of `block`
     work-items."""
-    var i = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
-    if i * 8 * F4_WIDEN_WORDS >= Int(count):
-        return
-    var words = src.unsafe_bitcast[UInt32]().unsafe_load[width=F4_WIDEN_WORDS](
-        i * F4_WIDEN_WORDS
-    )
-    var pair = scales.unsafe_bitcast[UInt16]().unsafe_load(i)
-    dst.unsafe_bitcast[UInt32]().unsafe_store(
-        i * 4 * F4_WIDEN_WORDS,
-        _f4_to_bf16_pairs(
-            words,
-            _e4m3_scale((pair & 0xFF).cast[DType.uint8]()),
-            _e4m3_scale((pair >> 8).cast[DType.uint8]()),
-        ),
-    )
+    var block = Int(block_dim.x)
+    var words = Int(count) // 8
+    var base = Int(block_idx.x) * block * F4_WIDEN_WORDS + Int(thread_idx.x)
+    var src32 = src.unsafe_bitcast[UInt32]()
+    var dst32 = dst.unsafe_bitcast[UInt32]()
+    comptime for t in range(F4_WIDEN_WORDS):
+        var w = base + t * block
+        if w < words:
+            # A word's 8 values lie in one 16-value block: scale w / 2.
+            dst32.unsafe_store(
+                4 * w,
+                _f4_word_to_bf16_pairs(
+                    src32.unsafe_load(w),
+                    _e4m3_scale(scales.unsafe_load(w // 2)),
+                ),
+            )

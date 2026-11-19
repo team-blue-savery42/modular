@@ -104,6 +104,17 @@ comptime F8_SKINNY_KS16_MAX_N = 2048
 """Largest N for which `skinny_kernel_f8` splits K over 16 sub-groups (8
 above it)."""
 
+comptime F4_SKINNY_SPLIT_N = 2048
+"""N above which `skinny_kernel_f4` runs `F4_SKINNY_KS_WIDE` sub-groups per
+work-group, else `F4_SKINNY_KS_NARROW`."""
+
+comptime F4_SKINNY_KS_WIDE = 8
+"""Sub-groups splitting K in `skinny_kernel_f4` for N above
+`F4_SKINNY_SPLIT_N`."""
+
+comptime F4_SKINNY_KS_NARROW = 16
+"""Sub-groups splitting K in `skinny_kernel_f4` up to `F4_SKINNY_SPLIT_N`."""
+
 
 @inline(.always)
 def _raw_buf[
@@ -488,6 +499,36 @@ def matmul_f8_dispatch_intel(
 
 
 @inline(.always)
+def _launch_skinny_f4[
+    c_type: DType, ks: Int
+](
+    ctx: DeviceContext,
+    c: MutPointer[Scalar[c_type], MutAnyOrigin],
+    a: MutPointer[Scalar[DType.bfloat16], MutAnyOrigin],
+    b: MutPointer[Scalar[DType.uint8], MutAnyOrigin],
+    scales: MutPointer[Scalar[DType.uint8], MutAnyOrigin],
+    m: Int,
+    n: Int,
+    k: Int,
+    scale: Float32,
+) raises:
+    """Launches `skinny_kernel_f4` with `ks` sub-groups per work-group."""
+    comptime kern = skinny_kernel_f4[c_type, ks=ks]
+    ctx.enqueue_function[kern](
+        c,
+        a,
+        b,
+        scales,
+        Int64(m),
+        Int64(n),
+        Int64(k),
+        scale,
+        grid_dim=skinny_grid(n),
+        block_dim=skinny_block[ks](),
+    )
+
+
+@inline(.always)
 def matmul_f4_dispatch_intel(
     c: TileTensor[mut=True, ...],
     a: TileTensor[DType.bfloat16, ...],
@@ -550,33 +591,13 @@ def matmul_f4_dispatch_intel(
         var sp = _raw(scales).unsafe_bitcast[UInt8]()
         var f4_scale = scale * F4_UNIT
         if m <= SKINNY_MAX_M:
-            if n > F8_SKINNY_KS16_MAX_N:
-                comptime kern = skinny_kernel_f4[c_type, ks=8]
-                ctx.enqueue_function[kern](
-                    cp,
-                    ap,
-                    bp,
-                    sp,
-                    Int64(m),
-                    Int64(n),
-                    Int64(k),
-                    f4_scale,
-                    grid_dim=skinny_grid(n),
-                    block_dim=skinny_block[8](),
+            if n > F4_SKINNY_SPLIT_N:
+                _launch_skinny_f4[c_type, F4_SKINNY_KS_WIDE](
+                    ctx, cp, ap, bp, sp, m, n, k, f4_scale
                 )
             else:
-                comptime kern = skinny_kernel_f4[c_type, ks=16]
-                ctx.enqueue_function[kern](
-                    cp,
-                    ap,
-                    bp,
-                    sp,
-                    Int64(m),
-                    Int64(n),
-                    Int64(k),
-                    f4_scale,
-                    grid_dim=skinny_grid(n),
-                    block_dim=skinny_block[16](),
+                _launch_skinny_f4[c_type, F4_SKINNY_KS_NARROW](
+                    ctx, cp, ap, bp, sp, m, n, k, f4_scale
                 )
             return True
         # Widen B^T once to bfloat16 (values times their block scale /
