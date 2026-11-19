@@ -14863,7 +14863,7 @@ def intel_grouped_weight_only_nvfp4_matmul(
     expert_ids: TensorValue,
     expert_scales: TensorValue,
 ) -> TensorValue:
-    """Intel weight-only NVFP4 (W4A16) grouped matmul for MoE experts.
+    """Intel weight-only NVFP4 or MXFP4 (W4A16) grouped matmul for MoE experts.
 
     For each group ``z``, rows ``expert_start[z]`` to ``expert_start[z + 1]``
     of the result are ``(a[rows] @ dequant(b[e]).T) * expert_scales[e]`` with
@@ -14873,7 +14873,9 @@ def intel_grouped_weight_only_nvfp4_matmul(
         a: The bf16 activation, ``[M, K]``, rows grouped by expert.
         b: The packed E2M1 weights, uint8 ``[E, N, K // 2]``, low nibble
             first.
-        b_scales: The float8_e4m3fn block scales, ``[E, N, K // 16]``.
+        b_scales: The block scales: float8_e4m3fn ``[E, N, K // 16]``
+            (NVFP4), or float8_e8m0fnu ``[E, N, K // 32]`` (MXFP4, with unit
+            ``expert_scales``).
         expert_start: uint32 ``[G + 1]``, each group's first row, then M
             (``moe_create_indices``).
         expert_ids: int32 ``[G]``, each group's expert.
@@ -14888,9 +14890,10 @@ def intel_grouped_weight_only_nvfp4_matmul(
         raise ValueError(f"activation a must be bfloat16, got {a.dtype}")
     if b.dtype != DType.uint8:
         raise ValueError(f"weight b must be uint8 (packed E2M1), got {b.dtype}")
-    if b_scales.dtype != DType.float8_e4m3fn:
+    if b_scales.dtype not in (DType.float8_e4m3fn, DType.float8_e8m0fnu):
         raise ValueError(
-            f"b_scales must be float8_e4m3fn, got {b_scales.dtype}"
+            "b_scales must be float8_e4m3fn (NVFP4) or float8_e8m0fnu"
+            f" (MXFP4), got {b_scales.dtype}"
         )
     return ops.custom(
         "mo.grouped.matmul.weight.only.block.scaled.float4.intel",

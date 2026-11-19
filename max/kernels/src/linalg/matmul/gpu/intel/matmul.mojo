@@ -1076,6 +1076,17 @@ def _e4m3_scale(byte: UInt8) -> Float32:
 
 
 @inline(.always)
+def _e8m0_scale(byte: UInt8) -> Float32:
+    """A float8_e8m0fnu block scale (MXFP4's, 2**(byte - 127)) / 256, as
+    `_e4m3_scale` gives an E4M3 one: the float32 with exponent field byte -
+    8. Exact for bytes 9 to 254 (the widened values stay normal bfloat16 for
+    bytes from 24); smaller ones give zero."""
+    var e = byte.cast[DType.uint32]()
+    var bits = (e - 8) << 23 if e > 8 else UInt32(0)
+    return bitcast[DType.float32, 1](bits)
+
+
+@inline(.always)
 def _f4_to_bf16_pairs(
     words: SIMD[DType.uint32, 4], s0: Float32, s1: Float32
 ) -> SIMD[DType.uint32, 16]:
@@ -1127,7 +1138,7 @@ E2M1 codes covers 64 values of each B^T row."""
 
 @inline(.always)
 def _k_step_f4[
-    sg_m: Int, sg_n: Int
+    sg_m: Int, sg_n: Int, mx: Bool = False
 ](
     acc: MutPointer[Scalar[DType.float32], _, address_space=AddressSpace.LOCAL],
     a: MutPointer[Scalar[DType.bfloat16], MutAnyOrigin],
@@ -1176,25 +1187,41 @@ def _k_step_f4[
             # `kk` are multiples of 64. Rows past N read row N - 1 (their
             # columns aren't stored).
             var row = min(n0 + 32 * j + lane + 16 * i, n - 1)
-            var quad = scales.unsafe_bitcast[UInt32]().unsafe_load(
-                (row * k16 + kk // 16) // 4
-            )
+            # NVFP4: four E4M3 scales of 16 (one aligned 4-byte load). MXFP4
+            # (`mx`): two E8M0 scales of 32 (one aligned 2-byte load).
+            var quad: UInt32
+            comptime if mx:
+                quad = (
+                    scales.unsafe_bitcast[UInt16]()
+                    .unsafe_load((row * (k // 32) + kk // 32) // 2)
+                    .cast[DType.uint32]()
+                )
+            else:
+                quad = scales.unsafe_bitcast[UInt32]().unsafe_load(
+                    (row * k16 + kk // 16) // 4
+                )
             comptime cb = 2 * j + i
             comptime for t in range(2):
                 var words = SIMD[DType.uint32, 4]()
                 comptime for w in range(4):
                     words[w] = v[2 * (4 * t + w) + i]
-                var pairs = _f4_to_bf16_pairs(
-                    words,
-                    _e4m3_scale(
+                var s0: Float32
+                var s1: Float32
+                comptime if mx:
+                    s0 = _e8m0_scale(
+                        ((quad >> UInt32(8 * t)) & 0xFF).cast[DType.uint8]()
+                    )
+                    s1 = s0
+                else:
+                    s0 = _e4m3_scale(
                         ((quad >> UInt32(16 * t)) & 0xFF).cast[DType.uint8]()
-                    ),
-                    _e4m3_scale(
+                    )
+                    s1 = _e4m3_scale(
                         ((quad >> UInt32(16 * t + 8)) & 0xFF).cast[
                             DType.uint8
                         ]()
-                    ),
-                )
+                    )
+                var pairs = _f4_to_bf16_pairs(words, s0, s1)
                 comptime for h in range(2):
                     var bp = pairs.slice[8, offset=8 * h]()
                     comptime for r in range(rows):
@@ -1254,6 +1281,7 @@ def grouped_kernel_f4[
     sg_m: Int = 16,
     sg_n: Int = SKINNY_SG_N,
     ks: Int = skinny_ks[True](),
+    mx: Bool = False,
 ](
     c: MutPointer[Scalar[c_type], MutAnyOrigin],
     a: MutPointer[Scalar[DType.bfloat16], MutAnyOrigin],
@@ -1268,8 +1296,9 @@ def grouped_kernel_f4[
     """The grouped (MoE) form of `skinny_kernel_f4`: for each group z,
     `C[r0:r1] = expert_scales[e] * A[r0:r1] * B[e]` with `r0, r1 =
     a_offsets[z], a_offsets[z + 1]` and `e = expert_ids[z]`, B[e] the
-    expert's FP4 B^T (N x K / 2 bytes of E2M1 codes, N x K / 16 E4M3 block
-    scales, experts packed one after another). Groups with no rows or an
+    expert's FP4 B^T (N x K / 2 bytes of E2M1 codes and its block scales:
+    N x K / 16 E4M3 ones (NVFP4), or with `mx` N x K / 32 E8M0 ones (MXFP4),
+    experts packed one after another). Groups with no rows or an
     expert id below 0 store nothing. Launched with `skinny_grid(n)` x groups
     work-groups of `skinny_block[ks]()`: work-group (x, z) takes columns
     `x * sg_n` of group z, `sg_m` rows at a time."""
@@ -1285,7 +1314,7 @@ def grouped_kernel_f4[
     var nn = Int(n)
     var kk = Int(k)
     var be = b + expert * nn * (kk // 2)
-    var se = scales + expert * nn * (kk // 16)
+    var se = scales + expert * nn * (kk // (32 if mx else 16))
     var sg = Int(thread_idx.x) // 16
     var n0 = Int(block_idx.x) * sg_n
     var scale = expert_scales[expert] * F4_UNIT
@@ -1304,7 +1333,7 @@ def grouped_kernel_f4[
             acc.unsafe_store(8 * i, SIMD[DType.float32, 8](0))
         var s = sg
         while s < steps:
-            _k_step_f4[sg_m, sg_n](
+            _k_step_f4[sg_m, sg_n, mx](
                 acc, am, be, se, m, nn, kk, s * F4_K_STEP, n0
             )
             s += ks

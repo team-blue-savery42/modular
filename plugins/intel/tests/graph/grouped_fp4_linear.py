@@ -24,7 +24,10 @@ Shapes are Gemma-4-26B-A4B's experts (gate and up fused 1408 x 2816, down
 2816 x 704) with 16 experts in a shuffled group order: decode (one token,
 8 of 16 groups one row each: the 8-row tiles), a few tokens, and prefill
 with empty groups and groups longer than a tile; and the smallest shape the
-kernel takes (K = 128, N = 40).
+kernel takes (K = 128, N = 40). MXFP4 cases (float8_e8m0fnu scales per 32,
+exponents 100-150 around gpt-oss-20b's 115-136, unit expert scales) at
+gpt-oss-20b's experts (gate and up 5760 x 2880, down 2880 x 2880):
+decode and prefill.
 """
 
 from __future__ import annotations
@@ -67,34 +70,48 @@ def main() -> int:
     experts = 16
     fails = 0
     cases = [
-        ("decode", 1408, 2816, [1] * 8 + [0] * 8),
-        ("decode down", 2816, 704, [1] * 8 + [0] * 8),
+        ("decode", False, 1408, 2816, [1] * 8 + [0] * 8),
+        ("decode down", False, 2816, 704, [1] * 8 + [0] * 8),
         (
             "4 tokens",
+            False,
             1408,
             2816,
             [2, 4, 0, 1, 3, 2, 0, 4, 2, 1, 2, 3, 2, 2, 2, 2],
         ),
         (
             "prefill",
+            False,
             1408,
             2816,
             [100, 0, 33, 17, 16, 1, 0, 64, 15, 40, 9, 0, 70, 50, 47, 50],
         ),
         (
             "prefill down",
+            False,
             2816,
             704,
             [100, 0, 33, 17, 16, 1, 0, 64, 15, 40, 9, 0, 70, 50, 47, 50],
         ),
-        ("smallest", 40, 128, [3, 0, 20, 1] + [0] * 12),
+        ("smallest", False, 40, 128, [3, 0, 20, 1] + [0] * 12),
+        ("mx decode", True, 5760, 2880, [1] * 4 + [0] * 12),
+        ("mx decode down", True, 2880, 2880, [1] * 4 + [0] * 12),
+        (
+            "mx prefill",
+            True,
+            5760,
+            2880,
+            [100, 0, 33, 17, 16, 1, 0, 64, 15, 40, 9, 0, 70, 50, 47, 50],
+        ),
     ]
-    for name, n, k, counts in cases:
+    for name, mx, n, k, counts in cases:
         m = sum(counts)
+        blk = 32 if mx else 16
+        sdt = DType.float8_e8m0fnu if mx else DType.float8_e4m3fn
         types = [
             TensorType(DType.bfloat16, [m, k], device=gpu),
             TensorType(DType.uint8, [experts, n, k // 2], device=gpu),
-            TensorType(DType.float8_e4m3fn, [experts, n, k // 16], device=gpu),
+            TensorType(sdt, [experts, n, k // blk], device=gpu),
             TensorType(DType.uint32, [experts + 1], device=gpu),
             TensorType(DType.int32, [experts], device=gpu),
             TensorType(DType.float32, [experts], device=gpu),
@@ -110,17 +127,23 @@ def main() -> int:
         xb = bf16_bits(rng.uniform(-1, 1, (m, k)))
         codes = rng.integers(0, 16, (experts, n, k), dtype=np.uint8)
         packed = (codes[..., 0::2] | (codes[..., 1::2] << 4)).astype(np.uint8)
-        scodes = rng.integers(0x20, 0x60, (experts, n, k // 16), dtype=np.uint8)
-        scodes[rng.random(scodes.shape) < 0.25] |= 0x80
-        ws2 = rng.uniform(0.005, 0.02, experts).astype(np.float32)
+        if mx:
+            scodes = rng.integers(
+                100, 151, (experts, n, k // 32), dtype=np.uint8
+            )
+            ws2 = np.ones(experts, dtype=np.float32)
+        else:
+            scodes = rng.integers(
+                0x20, 0x60, (experts, n, k // 16), dtype=np.uint8
+            )
+            scodes[rng.random(scodes.shape) < 0.25] |= 0x80
+            ws2 = rng.uniform(0.005, 0.02, experts).astype(np.float32)
         offsets = np.concatenate([[0], np.cumsum(counts)]).astype(np.uint32)
         ids = rng.permutation(experts).astype(np.int32)
         (out,) = model.execute(
             Buffer.from_numpy(xb).view(DType.bfloat16, [m, k]).to(dev),
             Buffer.from_numpy(packed).to(dev),
-            Buffer.from_numpy(scodes)
-            .view(DType.float8_e4m3fn, [experts, n, k // 16])
-            .to(dev),
+            Buffer.from_numpy(scodes).view(sdt, [experts, n, k // blk]).to(dev),
             Buffer.from_numpy(offsets).to(dev),
             Buffer.from_numpy(ids).to(dev),
             Buffer.from_numpy(ws2).to(dev),
@@ -134,7 +157,12 @@ def main() -> int:
             if r0 == r1:
                 continue
             e = int(ids[z])
-            wf = E2M1[codes[e]] * np.repeat(e4m3_abs(scodes[e]), 16, axis=1)
+            sv = (
+                np.exp2(scodes[e].astype(np.float64) - 127)
+                if mx
+                else e4m3_abs(scodes[e])
+            )
+            wf = E2M1[codes[e]] * np.repeat(sv, blk, axis=1)
             ref = xf[r0:r1] @ wf.T * float(ws2[e])
             mag = np.abs(xf[r0:r1]) @ np.abs(wf).T * float(ws2[e])
             err = max(

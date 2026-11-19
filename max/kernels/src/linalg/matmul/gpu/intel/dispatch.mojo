@@ -667,7 +667,7 @@ more than one row (prefill); 8 otherwise (decode)."""
 
 @inline(.always)
 def _launch_grouped_f4[
-    c_type: DType, ks: Int, sg_m: Int
+    c_type: DType, ks: Int, sg_m: Int, mx: Bool
 ](
     ctx: DeviceContext,
     c: MutPointer[Scalar[c_type], MutAnyOrigin],
@@ -683,7 +683,7 @@ def _launch_grouped_f4[
 ) raises:
     """Launches `grouped_kernel_f4` with `ks` sub-groups per work-group and
     `sg_m` rows of A per DPAS tile over `groups` groups."""
-    comptime kern = grouped_kernel_f4[c_type, sg_m=sg_m, ks=ks]
+    comptime kern = grouped_kernel_f4[c_type, sg_m=sg_m, ks=ks, mx=mx]
     ctx.enqueue_function[kern](
         c,
         a,
@@ -701,7 +701,7 @@ def _launch_grouped_f4[
 
 @inline(.always)
 def _grouped_f4_ks[
-    c_type: DType, sg_m: Int
+    c_type: DType, sg_m: Int, mx: Bool
 ](
     ctx: DeviceContext,
     c: MutPointer[Scalar[c_type], MutAnyOrigin],
@@ -717,7 +717,7 @@ def _grouped_f4_ks[
 ) raises:
     """`_launch_grouped_f4` with the dense FP4 kernel's K split for N."""
     if n > F4_SKINNY_SPLIT_N:
-        _launch_grouped_f4[c_type, F4_SKINNY_KS_WIDE, sg_m](
+        _launch_grouped_f4[c_type, F4_SKINNY_KS_WIDE, sg_m, mx](
             ctx,
             c,
             a,
@@ -731,7 +731,7 @@ def _grouped_f4_ks[
             k,
         )
     else:
-        _launch_grouped_f4[c_type, F4_SKINNY_KS_NARROW, sg_m](
+        _launch_grouped_f4[c_type, F4_SKINNY_KS_NARROW, sg_m, mx](
             ctx,
             c,
             a,
@@ -751,13 +751,13 @@ def grouped_matmul_f4_dispatch_intel(
     c: TileTensor[mut=True, ...],
     a: TileTensor[DType.bfloat16, ...],
     b: TileTensor[DType.uint8, ...],
-    scales: TileTensor[DType.float8_e4m3fn, ...],
+    scales: TileTensor[...],
     a_offsets: TileTensor[DType.uint32, ...],
     expert_ids: TileTensor[DType.int32, ...],
     expert_scales: TileTensor[DType.float32, ...],
     ctx: DeviceContext,
 ) raises -> Bool:
-    """Runs the grouped (MoE) weight-only NVFP4 matmul `c[r0:r1] =
+    """Runs the grouped (MoE) weight-only NVFP4 or MXFP4 matmul `c[r0:r1] =
     expert_scales[e] * a[r0:r1] @ dequant(b[e])^T` for each group z (`r0,
     r1 = a_offsets[z], a_offsets[z + 1]`, `e = expert_ids[z]`) with
     `grouped_kernel_f4` and returns True, or returns False, launching
@@ -768,7 +768,8 @@ def grouped_matmul_f4_dispatch_intel(
             of groups whose expert id is below 0 are not written.
         a: `(M, K)`, bfloat16, rows grouped by expert.
         b: `(E, N, K / 2)`, packed E2M1 codes.
-        scales: `(E, N, K / 16)`, float8_e4m3fn block scales.
+        scales: `(E, N, K / 16)` float8_e4m3fn block scales (NVFP4), or
+            `(E, N, K / 32)` float8_e8m0fnu ones (MXFP4).
         a_offsets: `(G + 1,)`, each group's first row, then M.
         expert_ids: `(G,)`, each group's expert.
         expert_scales: `(E,)`, each expert's weight scale (NVFP4's
@@ -789,7 +790,13 @@ def grouped_matmul_f4_dispatch_intel(
         and a.address_space == AddressSpace.GENERIC
         and b.address_space == AddressSpace.GENERIC
         and scales.address_space == AddressSpace.GENERIC
+        and (
+            scales.dtype == DType.float8_e4m3fn
+            or scales.dtype == DType.float8_e8m0fnu
+        )
     )
+    comptime mx = scales.dtype == DType.float8_e8m0fnu
+    comptime block = 32 if mx else 16
     comptime if not taken:
         return False
     else:
@@ -808,7 +815,7 @@ def grouped_matmul_f4_dispatch_intel(
             and Int(b.dim[2]()) * 2 == k
             and Int(scales.dim[0]()) == experts
             and Int(scales.dim[1]()) == n
-            and Int(scales.dim[2]()) * 16 == k
+            and Int(scales.dim[2]()) * block == k
             and Int(a_offsets.dim[0]()) == groups + 1
             and Int(expert_scales.dim[0]()) == experts
             and Int(c.layout.stride[1]().value()) == 1
@@ -830,11 +837,11 @@ def grouped_matmul_f4_dispatch_intel(
         if m <= groups:
             # At most one row per group on average (decode): one DPAS row
             # block per tile.
-            _grouped_f4_ks[c_type, 8](
+            _grouped_f4_ks[c_type, 8, mx](
                 ctx, cp, ap, bp, sp, op, ip, xp, groups, n, k
             )
         else:
-            _grouped_f4_ks[c_type, F4_GROUPED_SG_M](
+            _grouped_f4_ks[c_type, F4_GROUPED_SG_M, mx](
                 ctx, cp, ap, bp, sp, op, ip, xp, groups, n, k
             )
         return True

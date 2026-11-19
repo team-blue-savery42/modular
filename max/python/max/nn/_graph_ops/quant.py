@@ -39,6 +39,7 @@ from max.nn._graph_ops import (
     dynamic_scaled_matmul,
     grouped_dynamic_scaled_fp8_matmul,
     grouped_matmul_ragged,
+    intel_grouped_weight_only_nvfp4_matmul,
     matmul_static_scaled_float8,
     mxfp4_dequant,
     mxfp6_dequant,
@@ -1094,6 +1095,28 @@ def quantized_grouped_matmul(
     """
     match quant_config.format:
         case QuantFormat.MXFP4:
+            if (
+                x.device.is_gpu()
+                and _is_intel_xe2_gpu()
+                and weight_scale.dtype == DType.float8_e8m0fnu
+                and weight_scale.rank == 3
+            ):
+                # Intel Xe2 weight-only (W4A16): the grouped FP4 kernel
+                # widens each expert's codes with their E8M0 scales in
+                # registers, rather than a bf16 copy of every expert on each
+                # forward. It reads each group's rows on the device, so the
+                # usage stats aren't used.
+                return intel_grouped_weight_only_nvfp4_matmul(
+                    x,
+                    weight,
+                    weight_scale,
+                    expert_start_indices,
+                    expert_ids,
+                    ops.broadcast_to(
+                        ops.constant(1.0, DType.float32, device=x.device),
+                        [weight.shape[0]],
+                    ),
+                )
             dequanted = mxfp4_dequant(
                 weight, weight_scale, out_type=DType.bfloat16
             )

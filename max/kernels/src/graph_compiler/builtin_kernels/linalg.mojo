@@ -2345,8 +2345,9 @@ struct Struct_grouped_matmul_weight_only_block_scaled_float4_intel:
 
     The grouped form of `mo.matmul.weight.only.block.scaled.float4.intel`:
     the activation stays bf16, each expert's packed E2M1 weight (`b`, `(E,
-    N, K / 2)`) is widened with its float8_e4m3fn block scales (`(E, N, K /
-    16)`) to bf16 in registers, and the expert's `weight_scale_2`
+    N, K / 2)`) is widened with its block scales (float8_e4m3fn per 16, `(E,
+    N, K / 16)`: NVFP4; or float8_e8m0fnu per 32, `(E, N, K / 32)`: MXFP4,
+    whose `expert_scales` are ones) to bf16 in registers, and the expert's `weight_scale_2`
     (`expert_scales`, `(E,)` float32 on the device) scales its float32
     accumulators.
     """
@@ -2381,7 +2382,7 @@ struct Struct_grouped_matmul_weight_only_block_scaled_float4_intel:
             c.to_tile_tensor(),
             a.to_tile_tensor[.bfloat16](),
             b.to_tile_tensor[.uint8](),
-            scales.to_tile_tensor[.float8_e4m3fn](),
+            scales.to_tile_tensor(),
             expert_start.to_tile_tensor[.uint32](),
             expert_ids.to_tile_tensor[.int32](),
             expert_scales.to_tile_tensor[.float32](),
