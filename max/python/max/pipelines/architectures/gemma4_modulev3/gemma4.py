@@ -28,6 +28,7 @@ from max.nn.common_layers.quant_linear import (
     tensor_parallel_mlp,
 )
 from max.nn.common_layers.rotary_embedding import RotaryEmbedding
+from max.nn.intel_fp8 import weight_matmul
 from max.nn.kv_cache import (
     KVCacheParamInterface,
     KVCacheParams,
@@ -228,7 +229,7 @@ class Gemma4TextModel(Module[..., tuple[Tensor, ...]]):
 
     def _compute_logits(self, h: Tensor) -> Tensor:
         if self.tie_word_embeddings:
-            outputs = h @ self.embed_tokens.weight.T
+            outputs = weight_matmul(h, self.embed_tokens.weight)
             outputs = F.allgather(outputs, tensor_axis=-1)
         else:
             assert self.lm_head is not None

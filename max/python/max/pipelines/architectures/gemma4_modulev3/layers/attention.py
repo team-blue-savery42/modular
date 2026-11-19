@@ -32,6 +32,7 @@ from max.nn.common_layers.quant_linear import (
     QuantizedLinear,
 )
 from max.nn.common_layers.rotary_embedding import RotaryEmbedding
+from max.nn.intel_fp8 import weight_matmul
 from max.nn.kernels import flash_attention_ragged, rope_split_store_ragged
 from max.nn.kv_cache import KVCacheParams
 from max.nn.quant_config import QuantConfig
@@ -154,7 +155,7 @@ class Gemma4Attention(Module[..., Tensor]):
         sharing assumptions.
         """
         if not self._is_quantized:
-            fused = x @ self.wqkv.T
+            fused = weight_matmul(x, self.wqkv)
             splits = (
                 [self.q_weight_dim, self.kv_weight_dim, self.kv_weight_dim]
                 if self._has_v_proj

@@ -20,6 +20,7 @@ from typing import Literal, Protocol, TypeVar
 from max import functional as F
 from max.functional import random
 from max.graph import DimLike
+from max.nn.intel_fp8 import weight_matmul
 from max.nn.linear import Linear
 from max.nn.transparent_module import TransparentModule
 from max.tensor import Tensor
@@ -145,7 +146,7 @@ class QKVLinear(TransparentModule[[Tensor], Tensor]):
 
     def forward(self, x: Tensor) -> Tensor:
         """Applies the fused q/k/v projection: ``x @ fused_weight.T + bias``."""
-        return x @ self.fused_weight.T + self.fused_bias
+        return weight_matmul(x, self.fused_weight) + self.fused_bias
 
 
 class ColumnParallelLinear(Linear):

@@ -25,6 +25,7 @@ from max.nn._graph_ops import (
     matmul_static_scaled_float8,
     quantize_static_scaled_float8,
 )
+from max.nn.intel_fp8 import weight_matmul
 from max.nn.quant_config import QuantConfig
 from max.tensor import Tensor
 from max.tensor.sharding import (
@@ -153,8 +154,9 @@ class Linear(Module[[Tensor], Tensor]):
             if y.is_distributed:
                 y = y.rebind_mapping(_matmul_mapping(x, self.weight))
             return y + self.bias
-        # Matmul needs one dtype; the input takes the weight's.
-        return x.cast(self.weight.dtype) @ self.weight.T + self.bias
+        # Matmul needs one dtype; the input takes the weight's. A bf16 weight
+        # may run as FP8 on Intel Xe2 (max.nn.intel_fp8, opt-in).
+        return weight_matmul(x.cast(self.weight.dtype), self.weight) + self.bias
 
 
 def _matmul_mapping(x: Tensor, weight: Tensor) -> DeviceMapping:

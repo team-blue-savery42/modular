@@ -21,6 +21,7 @@ from max.nn.common_layers.linear import (
     ColumnParallelLinear,
     RowParallelLinear,
 )
+from max.nn.intel_fp8 import weight_matmul
 from max.tensor import Tensor
 
 from .activation import activation_function_from_name
@@ -110,22 +111,12 @@ class MLP(Module[[Tensor], Tensor]):
             bias = F.concat((gate_proj_bias, up_proj_bias))
 
             output = F.add(
-                F.matmul(
-                    x,
-                    F.transpose(
-                        F.concat((gate_proj_weight, up_proj_weight)),
-                        -1,
-                        -2,
-                    ),
-                ),
+                weight_matmul(x, F.concat((gate_proj_weight, up_proj_weight))),
                 bias,
             )
         else:
-            output = F.matmul(
-                x,
-                F.transpose(
-                    F.concat((gate_proj_weight, up_proj_weight)), -1, -2
-                ),
+            output = weight_matmul(
+                x, F.concat((gate_proj_weight, up_proj_weight))
             )
 
         gate_out, up_out = F.split(
