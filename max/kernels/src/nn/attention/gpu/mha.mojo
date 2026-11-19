@@ -2289,7 +2289,6 @@ def flash_attention_dispatch[
             ctx.default_device_info.api == "level_zero"
             and ctx.default_device_info.version == "xe2"
             and ragged
-            and not sink
             and output.dtype == dtype
             and not k_t.quantization_enabled
             and k_t.v_col_base == 0
@@ -2305,6 +2304,7 @@ def flash_attention_dispatch[
                     num_heads=num_heads,
                     group=group,
                     _is_cache_length_accurate=_is_cache_length_accurate,
+                    sink=sink,
                 ](
                     q,
                     k,
@@ -2318,6 +2318,7 @@ def flash_attention_dispatch[
                     max_cache_valid_length,
                     is_token_generation,
                     ctx,
+                    sink_weights,
                 )
             else:
                 mha_gpu_naive[

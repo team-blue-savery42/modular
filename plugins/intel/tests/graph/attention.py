@@ -79,10 +79,23 @@ if os.environ.get("ATTN_SHAPE") == "qwen3-8b":
     NQ, NKV, HD, PAGE = 32, 8, 128, 128
 elif os.environ.get("ATTN_SHAPE") == "gemma4-global":
     NQ, NKV, HD, PAGE = 16, 2, 512, 128
+elif os.environ.get("ATTN_SHAPE") == "gpt-oss":
+    NQ, NKV, HD, PAGE = 64, 8, 64, 128
 else:
     NQ, NKV, HD, PAGE = 8, 2, 256, 256
 BF = DType.bfloat16
 SCALE = 1.0 / HD**0.5
+# ATTN_SHAPE=gpt-oss: gpt-oss-20b's attention, 64 query heads over 8 KV
+# heads (GQA 8), head dim 64, page 128, with a sink logit per head (gpt-oss's
+# learned sinks, here spread over -2..3 around the scores' range).
+# ATTN_WINDOW=W: the sliding-window causal mask (a query at position q sees
+# keys q - W + 1 .. q), as gpt-oss's alternate layers (W = 128).
+SINKS = (
+    rnd(np.linspace(-2.0, 3.0, NQ), BF)  # bf16 values, as the graph holds them
+    if os.environ.get("ATTN_SHAPE") == "gpt-oss"
+    else None
+)
+WINDOW = int(os.environ.get("ATTN_WINDOW", "0"))
 ATOL = 2e-2
 
 
@@ -109,6 +122,13 @@ def build(session, params, T, B, chain=1):
         kv = params.unflatten_kv_inputs(iter(g.inputs[2:]))[0]
         layer = ops.constant(0, DType.uint32, device=DeviceRef.CPU())
         x = q
+        sinks = (
+            None
+            if SINKS is None
+            else ops.constant(
+                SINKS, DType.float32, device=DeviceRef.GPU()
+            ).cast(BF)
+        )
         for _ in range(chain):
             x = flash_attention_ragged(
                 params,
@@ -116,8 +136,14 @@ def build(session, params, T, B, chain=1):
                 offsets,
                 kv,
                 layer,
-                mask_variant=MHAMaskVariant.CAUSAL_MASK,
+                mask_variant=(
+                    MHAMaskVariant.SLIDING_WINDOW_CAUSAL_MASK
+                    if WINDOW
+                    else MHAMaskVariant.CAUSAL_MASK
+                ),
                 scale=SCALE,
+                local_window_size=WINDOW or -1,
+                sink_weights=sinks,
             )
         g.output(x)
     return session.load(g)
@@ -189,9 +215,17 @@ class Attention:
                 )  # [pos+1, NQ, HD]
                 vh = np.repeat(v[: pos + 1], NQ // NKV, axis=1)
                 s = np.einsum("hd,khd->hk", qi, kh) * SCALE
-                s = np.exp(s - s.max(axis=1, keepdims=True))
-                s /= s.sum(axis=1, keepdims=True)
-                want[t] = np.einsum("hk,khd->hd", s, vh)
+                if WINDOW:
+                    s[:, : max(0, pos - WINDOW + 1)] = -np.inf
+                mx = s.max(axis=1, keepdims=True)
+                if SINKS is not None:
+                    sk = SINKS.reshape(-1, 1).astype(np.float64)
+                    mx = np.maximum(mx, sk)
+                e = np.exp(s - mx)
+                den = e.sum(axis=1, keepdims=True)
+                if SINKS is not None:
+                    den += np.exp(sk - mx)
+                want[t] = np.einsum("hk,khd->hd", e / den, vh)
                 t += 1
         err = float(np.abs(got - want).max())
         good = bool(np.isfinite(got).all()) and err <= ATOL

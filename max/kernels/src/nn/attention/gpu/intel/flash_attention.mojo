@@ -21,7 +21,8 @@ ragged batch of bfloat16 or float16 queries against a paged KV cache
 routine, `_attend`, which owns a few query rows (DPAS M):
 
 - **Prefill** (`intel_fa_prefill_kernel`): a work-group owns
-  `prefill_bq[depth]` queries (64 up to head dim 128, else `BQ`, 32) of one
+  `prefill_bq[depth, group]` queries (64 up to head dim 128, else `BQ`, 32,
+  fewer when the work-group would be too large) of one
   sequence and all `group` query heads that share one KV head (GQA), one
   sub-group of 16 work-items per `prefill_rows[depth]` queries (8 up to head
   dim 128, else 4) of one head (32 sub-groups for Qwen3.5's 8 / 2 heads and
@@ -61,13 +62,18 @@ page when `page_size % BN == 0` (checked by `intel_fa_supported`). Rows past
 the cache's length read as zeros (2D block loads clip at the given height).
 Needs sub-group size 16 (DPAS and block I/O assert it).
 
+With `sink`, each query head h has a sink logit `sinks[h]` in the scaled
+scores' units (gpt-oss): it raises the row's maximum and adds exp(sink - max)
+to its sum, and adds nothing to O, as `softmax_kernel`'s sink mode does.
+Prefill applies it at the end of a row; decode in the stitch.
+
 Tuning defines (defaults measured best on the B70): `intel_fa_rows` (4),
 `intel_fa_bn` (32), `intel_fa_bq` (32), `intel_fa_split` (32),
 `intel_fa_fill` (256).
 """
 
 from std.collections import OptionalReg
-from std.math import ceildiv, exp2
+from std.math import ceildiv, exp, exp2
 from std.math.constants import log2e
 from std.memory import stack_allocation
 from std.memory.address_space import AddressSpace
@@ -106,15 +112,27 @@ def prefill_rows[depth: Int]() -> Int:
     return get_defined_int["intel_fa_prefill_rows", 8 if depth <= 128 else 4]()
 
 
-def prefill_bq[depth: Int]() -> Int:
+comptime MAX_PREFILL_BLOCK = 512
+"""Most work-items of a prefill work-group: Level Zero refused 1,024 for the
+prefill kernel on the B70 (zeKernelSetGroupSize, at head dim 512 with GQA 8,
+and at head dim 64 with GQA 8)."""
+
+
+def prefill_bq[depth: Int, group: Int]() -> Int:
     """Queries of one head per prefill work-group: 64 up to head dim 128 (8%
-    faster at 4,096 tokens than 32 with 8-row sub-groups), `BQ` up to 256
-    (the work-group would pass 1,024 work-items), 8 above (each query row
-    block takes `out_splits` sub-groups; Level Zero refused 1,024 work-items
-    for that kernel on the B70)."""
-    comptime if depth > 256:
-        return 8
-    return BQ if depth > 128 else get_defined_int["intel_fa_prefill_bq", 64]()
+    faster at 4,096 tokens than 32 with 8-row sub-groups), else `BQ`, halved
+    (down to one row block) while the work-group (`group` heads, each row
+    block `out_splits` sub-groups) would pass `MAX_PREFILL_BLOCK`
+    work-items."""
+    var bq = BQ if depth > 128 else get_defined_int["intel_fa_prefill_bq", 64]()
+    comptime pr = prefill_rows[depth]()
+    while (
+        bq > pr
+        and bq // pr * group * out_splits[depth]() * WARP_SIZE
+        > MAX_PREFILL_BLOCK
+    ):
+        bq //= 2
+    return bq
 
 
 comptime MAX_OUT_DEPTH = 256
@@ -138,7 +156,7 @@ def head_splits[group: Int]() -> Int:
 def prefill_block[depth: Int, group: Int]() -> Int:
     """Work-items of a prefill work-group."""
     return (
-        prefill_bq[depth]()
+        prefill_bq[depth, group]()
         // prefill_rows[depth]()
         * group
         * out_splits[depth]()
@@ -198,7 +216,7 @@ def intel_fa_supported[
         and (depth <= MAX_OUT_DEPTH or depth % MAX_OUT_DEPTH == 0)
         and depth <= 2 * MAX_OUT_DEPTH
         and group >= 1
-        and prefill_block[depth, group]() <= (512 if depth > 256 else 1024)
+        and prefill_block[depth, group]() <= MAX_PREFILL_BLOCK
         and page_size > 0
         and page_size % BN == 0
     )
@@ -606,6 +624,7 @@ def intel_fa_prefill_kernel[
     num_heads: Int,
     group: Int,
     _is_cache_length_accurate: Bool,
+    sink: Bool = False,
 ](
     output: MutPointer[Scalar[dtype], MutAnyOrigin],
     q: MutPointer[Scalar[dtype], MutAnyOrigin],
@@ -614,6 +633,7 @@ def intel_fa_prefill_kernel[
     mask: mask_t,
     row_offsets: MutPointer[Scalar[DType.uint32], MutAnyOrigin],
     scale: Float32,
+    sinks: MutPointer[Scalar[dtype], MutAnyOrigin],
 ):
     """Prefill: grid (ceildiv(max queries, prefill_bq), KV heads, sequences),
     `prefill_bq / prefill_rows[depth]() * group * out_splits[depth]()`
@@ -635,7 +655,7 @@ def intel_fa_prefill_kernel[
     comptime if mask_t == CausalMask:
         # The last query blocks attend the most keys: launch them first.
         q_block = Int(grid_dim.x) - 1 - q_block
-    var q0 = q_block * prefill_bq[depth]() + PR * (sg // group)
+    var q0 = q_block * prefill_bq[depth, group]() + PR * (sg // group)
     var b = _seq_bounds[_is_cache_length_accurate](k, row_offsets, batch)
     var seq_start = b[0]
     var q_len = b[1]
@@ -682,7 +702,15 @@ def intel_fa_prefill_kernel[
         sg,
         od0,
     )
-    var inv = 1.0 / lane_group_sum[16](l)
+    var lsum = lane_group_sum[16](l)
+    var inv = 1.0 / lsum
+    comptime if sink:
+        # The sink joins the softmax at the row's maximum m' = max(m, sink):
+        # O and the sum scale by exp(m - m'), the sum gains exp(sink - m').
+        var sv = SIMD[DType.float32, PR](sinks[head].cast[DType.float32]())
+        var mf = max(m, sv)
+        var f = exp(m - mf)
+        inv = f / (lsum * f + exp(sv - mf))
     comptime for j in range(KS):
         var out = (o.unsafe_load[width=PR](PR * j) * inv).cast[dtype]()
         block_store[16, PR](
@@ -797,6 +825,7 @@ def intel_fa_decode_stitch[
     depth: Int,
     num_heads: Int,
     _is_cache_length_accurate: Bool,
+    sink: Bool = False,
 ](
     output: MutPointer[Scalar[dtype], MutAnyOrigin],
     o_part: MutPointer[Scalar[DType.float32], MutAnyOrigin],
@@ -804,6 +833,7 @@ def intel_fa_decode_stitch[
     k: k_t,
     row_offsets: MutPointer[Scalar[DType.uint32], MutAnyOrigin],
     num_splits: Int32,
+    sinks: MutPointer[Scalar[dtype], MutAnyOrigin],
 ):
     """Combines the decode splits: grid (heads, sequences), `depth`
     work-items."""
@@ -827,6 +857,10 @@ def intel_fa_decode_stitch[
             if s0 + i < active:
                 mv[i] = max(mv[i], ml_part[2 * (base + s0 + i)])
     var m = mv.reduce_max()
+    var sv = Float32(0)
+    comptime if sink:
+        sv = sinks[head].cast[DType.float32]()
+        m = max(m, sv)
     var lv = SIMD[DType.float32, U](0)
     var av = SIMD[DType.float32, U](0)
     for s0 in range(0, active, U):
@@ -837,6 +871,8 @@ def intel_fa_decode_stitch[
                 lv[i] += w * ml_part[2 * idx + 1]
                 av[i] += w * o_part[idx * depth + d]
     var l = lv.reduce_add()
+    comptime if sink:
+        l += exp(sv - m)
     var acc = av.reduce_add()
     output[(seq_start * num_heads + head) * depth + d] = (acc / l).cast[dtype]()
 
@@ -860,6 +896,7 @@ def intel_flash_attention[
     num_heads: Int,
     group: Int,
     _is_cache_length_accurate: Bool = False,
+    sink: Bool = False,
 ](
     q: TileTensor[mut=False, dtype, address_space=.GENERIC, ...],
     k: k_t,
@@ -873,11 +910,13 @@ def intel_flash_attention[
     max_cache_size: Int,
     is_token_generation: Bool,
     ctx: DeviceContext,
+    sink_weights: OptionalReg[ImmutTileTensor1D[dtype]] = None,
 ) raises:
     """Launches Intel flash attention for a ragged batch (see the module):
     the decode pair when every sequence has one query (`is_token_generation`),
     else the prefill kernel. `max_cache_size` bounds the keys of any
-    sequence; the caller checks `intel_fa_supported`."""
+    sequence; the caller checks `intel_fa_supported`. With `sink`,
+    `sink_weights` holds each query head's sink logit."""
     comptime assert num_heads % group == 0
     comptime kv_heads = num_heads // group
     if batch_size == 0 or max_prompt_len == 0 or max_cache_size == 0:
@@ -890,6 +929,16 @@ def intel_flash_attention[
     var offs = MutPointer[Scalar[DType.uint32], MutAnyOrigin](
         unsafe_from_address=Int(row_offsets.unsafe_ptr())
     )
+    # Without `sink` the kernels never read it: Q stands in.
+    var sinks = q_ptr
+    comptime if sink:
+        if not sink_weights:
+            raise Error(
+                "intel_flash_attention: sink attention needs sink_weights"
+            )
+        sinks = MutPointer[Scalar[dtype], MutAnyOrigin](
+            unsafe_from_address=Int(sink_weights.value().ptr)
+        )
     if is_token_generation:
         # A cache length that isn't accurate excludes the new token.
         var keys = max_cache_size + (
@@ -933,7 +982,7 @@ def intel_flash_attention[
             block_dim=WARP_SIZE,
         )
         comptime stitch = intel_fa_decode_stitch[
-            dtype, k_t, depth, num_heads, _is_cache_length_accurate
+            dtype, k_t, depth, num_heads, _is_cache_length_accurate, sink
         ]
         ctx.enqueue_function[stitch](
             o_ptr,
@@ -942,6 +991,7 @@ def intel_flash_attention[
             k,
             offs,
             Int32(splits),
+            sinks,
             grid_dim=(num_heads, batch_size),
             block_dim=depth,
         )
@@ -956,6 +1006,7 @@ def intel_flash_attention[
             num_heads,
             group,
             _is_cache_length_accurate,
+            sink,
         ]
         ctx.enqueue_function[prefill](
             o_ptr,
@@ -965,8 +1016,9 @@ def intel_flash_attention[
             mask,
             offs,
             scale,
+            sinks,
             grid_dim=(
-                ceildiv(max_prompt_len, prefill_bq[depth]()),
+                ceildiv(max_prompt_len, prefill_bq[depth, group]()),
                 kv_heads,
                 batch_size,
             ),
