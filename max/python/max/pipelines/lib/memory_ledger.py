@@ -149,7 +149,7 @@ def measures(devices: Sequence[Device]) -> bool:
 
 def _is_gpu(device: Device) -> bool:
     """Whether ``device`` is a GPU, which allocates its transients per step."""
-    return not device.is_host and device.api in ("cuda", "hip")
+    return not device.is_host and device.api in ("cuda", "hip", "level_zero")
 
 
 # ---------------------------------------------------------------------------
