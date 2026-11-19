@@ -866,7 +866,37 @@ def _skinny_impl[
         _k_step[transpose_b, sg_m, sg_n](acc, a, b, m, n, k, s * K_STEP, 0, n0)
         s += ks
     _scale_acc[b_type == DType.float8_e4m3fn, rows * cols](acc, scale)
+    _skinny_store[rows, cols, ks, has_epilogue_fn, has_compute_fn](
+        c, acc, m, n, n0, epilogue_fn, compute_fn
+    )
 
+
+@inline(.always)
+def _skinny_store[
+    c_type: DType,
+    EpilogueFnType: ElementwiseEpilogueFn,
+    ComputeFnType: ElementwiseComputeFn,
+    //,
+    rows: Int,
+    cols: Int,
+    ks: Int,
+    has_epilogue_fn: Bool,
+    has_compute_fn: Bool,
+](
+    c: MutPointer[Scalar[c_type], MutAnyOrigin],
+    acc: MutPointer[Scalar[DType.float32], _, address_space=AddressSpace.LOCAL],
+    m: Int,
+    n: Int,
+    n0: Int,
+    epilogue_fn: EpilogueFnType,
+    compute_fn: ComputeFnType,
+):
+    """Stores a skinny work-group's tile at columns `n0`: each sub-group's
+    `rows * cols` accumulators directly when `ks` is 1, else the sum of the
+    `ks` sub-groups' partial tiles."""
+    comptime tile = rows * cols * 8 * 16
+    comptime per = tile // (ks * 16)
+    var sg = Int(thread_idx.x) // 16
     comptime if ks == 1:
         _store_tile[rows, cols, has_epilogue_fn, has_compute_fn](
             c, acc, m, n, 0, n0, epilogue_fn, compute_fn
@@ -1013,4 +1043,221 @@ def skinny_kernel_f8[
     defaults, launched with `skinny_grid(n)` x `skinny_block[ks]()`."""
     _skinny_impl[True, sg_m, sg_n, ks, 0, False, False](
         c, a, b, Int(m), Int(n), Int(k), scale, no_epilogue_fn, no_compute_fn
+    )
+
+
+comptime F4_UNIT = Float32(16384)
+"""`_f4_to_bf16_pairs` gives each E2M1 value times its block scale / 2**22:
+the value / 2**14 and the E4M3 scale / 256. With the accumulators scaled by
+`F8_UNIT` (256, `_scale_acc`) the FP4 kernels take the weight scale times
+this (2**14) as their scale."""
+
+
+def gemm_f4_supported[c_type: DType](m: Int, n: Int, k: Int) -> Bool:
+    """Whether the FP4-weight kernels take this shape (bfloat16 A, B^T of
+    packed E2M1 codes with E4M3 block scales per 16, `c_type` C):
+    `gemm_supported`'s rules for A and C, and K a multiple of the FP4
+    skinny kernel's step (64) and at least 128 (B^T's rows of K / 2 bytes
+    at least 64 bytes wide)."""
+    return (
+        gemm_supported[DType.bfloat16, c_type](m, n, k)
+        and k % 64 == 0
+        and k >= 128
+    )
+
+
+@inline(.always)
+def _e4m3_scale(byte: UInt8) -> Float32:
+    """A float8_e4m3fn block scale / 256, its sign dropped (MAX's NVFP4
+    dequantization takes the scale's magnitude): the exponent and mantissa
+    bits placed as float16's give the value / 256 exactly."""
+    var h = (byte & 0x7F).cast[DType.uint16]() << 7
+    return bitcast[DType.float16, 1](h).cast[DType.float32]()
+
+
+@inline(.always)
+def _f4_to_bf16_pairs(
+    words: SIMD[DType.uint32, 4], s0: Float32, s1: Float32
+) -> SIMD[DType.uint32, 16]:
+    """Widens 4 words of 8 E2M1 codes each (K order from the low nibble of
+    the low byte) to the 16 words of bfloat16 pairs (K order from the low
+    half) of the values times their block scale (`s0` for K 0-15, `s1` for
+    K 16-31) / 2**14, exactly: a code's sign, exponent and mantissa placed
+    as float16's give the value / 2**14 (its subnormal 0.5 included), the
+    hardware widens float16 to float32, and the product with an E4M3 scale
+    has at most 6 significant bits, so its upper half is that bfloat16."""
+    var nib = SIMD[DType.uint16, 32]()
+    comptime for w in range(4):
+        comptime for j in range(8):
+            nib[8 * w + j] = ((words[w] >> UInt32(4 * j)) & 0xF).cast[
+                DType.uint16
+            ]()
+    var h = ((nib & 0x8) << 12) | ((nib & 0x7) << 9)
+    var f = bitcast[DType.float16, 32](h).cast[DType.float32]()
+    var sc = SIMD[DType.float32, 32](s1)
+    comptime for e in range(16):
+        sc[e] = s0
+    var u = bitcast[DType.uint32, 32](f * sc)
+    var even, odd = u.deinterleave()
+    return (even >> 16) | (odd & 0xFFFF0000)
+
+
+comptime F4_K_STEP = 64
+"""K per step of the FP4 skinny kernel: one transposed load of 8 words of 8
+E2M1 codes covers 64 values of each B^T row."""
+
+
+@inline(.always)
+def _k_step_f4[
+    sg_m: Int, sg_n: Int
+](
+    acc: MutPointer[Scalar[DType.float32], _, address_space=AddressSpace.LOCAL],
+    a: MutPointer[Scalar[DType.bfloat16], MutAnyOrigin],
+    b: MutPointer[Scalar[DType.uint8], MutAnyOrigin],
+    scales: MutPointer[Scalar[DType.uint8], MutAnyOrigin],
+    m: Int,
+    n: Int,
+    k: Int,
+    kk: Int,
+    n0: Int,
+):
+    """One `F4_K_STEP` (64) of a sub-group's tile with an FP4 B^T: per 32
+    columns of C one transposed load of 8 words of 8 E2M1 codes covers the
+    step (lane l gets B^T rows l and l + 16, element 2c + i is row l + 16i,
+    word c: words 0-3 are K 0-31, words 4-7 K 32-63), and each row's four
+    block scales of the step (one aligned 4-byte load) widen each 32-value
+    half to the bfloat16 pairs of its two 16-value halves
+    (`_f4_to_bf16_pairs`), multiplied by the A of that half."""
+    comptime rows = sg_m // 8
+    comptime cols = sg_n // 16
+    comptime a_vals = 2 * sg_m
+    comptime a_load = 32 if sg_m > 32 else sg_m
+    # Both halves' A: half t at offset t * a_vals.
+    var avs = SIMD[DType.bfloat16, 2 * a_vals]()
+    comptime for t in range(2):
+        comptime for c in range(sg_m // a_load):
+            var part = rebind[SIMD[DType.bfloat16, 2 * a_load]](
+                block_load[16, a_load, 2](
+                    a, k, m, k, kk + K_STEP * t, a_load * c
+                )
+            )
+            comptime for h in range(2):
+                avs = avs.insert[offset=t * a_vals + h * sg_m + a_load * c](
+                    part.slice[a_load, offset=h * a_load]()
+                )
+    var bw = b.unsafe_bitcast[UInt32]()
+    var k8 = k // 8
+    var k16 = k // 16
+    var lane = Int(thread_idx.x) % 16
+    comptime for j in range(sg_n // 32):
+        var v = rebind[SIMD[DType.uint32, 16]](
+            block_load_transpose[8, 32](bw, k8, n, k8, kk // 8, n0 + 32 * j)
+        )
+        comptime for i in range(2):
+            # The row's four scales of the step in one aligned load: K and
+            # `kk` are multiples of 64. Rows past N read row N - 1 (their
+            # columns aren't stored).
+            var row = min(n0 + 32 * j + lane + 16 * i, n - 1)
+            var quad = scales.unsafe_bitcast[UInt32]().unsafe_load(
+                (row * k16 + kk // 16) // 4
+            )
+            comptime cb = 2 * j + i
+            comptime for t in range(2):
+                var words = SIMD[DType.uint32, 4]()
+                comptime for w in range(4):
+                    words[w] = v[2 * (4 * t + w) + i]
+                var pairs = _f4_to_bf16_pairs(
+                    words,
+                    _e4m3_scale(
+                        ((quad >> UInt32(16 * t)) & 0xFF).cast[DType.uint8]()
+                    ),
+                    _e4m3_scale(
+                        ((quad >> UInt32(16 * t + 8)) & 0xFF).cast[
+                            DType.uint8
+                        ]()
+                    ),
+                )
+                comptime for h in range(2):
+                    var bp = pairs.slice[8, offset=8 * h]()
+                    comptime for r in range(rows):
+                        var af = avs.slice[
+                            8, offset=t * a_vals + h * sg_m + 8 * r
+                        ]()
+                        comptime ai = 8 * (r * cols + cb)
+                        var d = SIMD[DType.float32, 8]()
+                        mma(d, af, bp, acc.unsafe_load[width=8](ai))
+                        acc.unsafe_store(ai, d)
+
+
+def skinny_kernel_f4[
+    c_type: DType,
+    sg_m: Int = 16,
+    sg_n: Int = SKINNY_SG_N,
+    ks: Int = skinny_ks[True](),
+](
+    c: MutPointer[Scalar[c_type], MutAnyOrigin],
+    a: MutPointer[Scalar[DType.bfloat16], MutAnyOrigin],
+    b: MutPointer[Scalar[DType.uint8], MutAnyOrigin],
+    scales: MutPointer[Scalar[DType.uint8], MutAnyOrigin],
+    m: Int64,
+    n: Int64,
+    k: Int64,
+    scale: Float32,
+):
+    """`C = scale * A * B` for M <= `sg_m` with bfloat16 A and an FP4 B^T
+    (N x K / 2 bytes of E2M1 codes, N x K / 16 E4M3 block scales); `scale`
+    is the weight scale times `F4_UNIT`. Launched with `skinny_grid(n)` x
+    `skinny_block[ks]()`; sub-group sg takes K steps sg, sg + ks, ...."""
+    comptime rows = sg_m // 8
+    comptime cols = sg_n // 16
+    var sg = Int(thread_idx.x) // 16
+    var n0 = Int(block_idx.x) * sg_n
+    var kk = Int(k)
+    var steps = kk // F4_K_STEP
+    var acc = stack_allocation[
+        rows * cols * 8, DType.float32, address_space=AddressSpace.LOCAL
+    ]()
+    comptime for i in range(rows * cols):
+        acc.unsafe_store(8 * i, SIMD[DType.float32, 8](0))
+    var s = sg
+    while s < steps:
+        _k_step_f4[sg_m, sg_n](
+            acc, a, b, scales, Int(m), Int(n), kk, s * F4_K_STEP, n0
+        )
+        s += ks
+    _scale_acc[True, rows * cols](acc, scale)
+    _skinny_store[rows, cols, ks, False, False](
+        c, acc, Int(m), Int(n), n0, no_epilogue_fn, no_compute_fn
+    )
+
+
+comptime F4_WIDEN_WORDS = 4
+"""Words of 8 E2M1 codes `f4_widen_kernel` widens per work-item."""
+
+
+def f4_widen_kernel(
+    dst: MutPointer[Scalar[DType.bfloat16], MutAnyOrigin],
+    src: MutPointer[Scalar[DType.uint8], MutAnyOrigin],
+    scales: MutPointer[Scalar[DType.uint8], MutAnyOrigin],
+    count: Int64,
+):
+    """Widens `count` E2M1 values (a multiple of 32, two per byte of `src`,
+    with one E4M3 scale per 16 consecutive values in `scales`) to bfloat16
+    values times their scale / 2**22 (`_f4_to_bf16_pairs`), 32 per
+    work-item: launch `ceildiv(count, 32 * block)` work-groups of `block`
+    work-items."""
+    var i = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    if i * 8 * F4_WIDEN_WORDS >= Int(count):
+        return
+    var words = src.unsafe_bitcast[UInt32]().unsafe_load[width=F4_WIDEN_WORDS](
+        i * F4_WIDEN_WORDS
+    )
+    var pair = scales.unsafe_bitcast[UInt16]().unsafe_load(i)
+    dst.unsafe_bitcast[UInt32]().unsafe_store(
+        i * 4 * F4_WIDEN_WORDS,
+        _f4_to_bf16_pairs(
+            words,
+            _e4m3_scale((pair & 0xFF).cast[DType.uint8]()),
+            _e4m3_scale((pair >> 8).cast[DType.uint8]()),
+        ),
     )

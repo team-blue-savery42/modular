@@ -28,7 +28,7 @@ from max.driver import (
 )
 from max.dtype import DType
 from max.graph import DeviceRef, TensorValue
-from max.nn._graph_ops import _is_amd_gpu
+from max.nn._graph_ops import _is_amd_gpu, _is_intel_xe2_gpu
 from max.nn._graph_ops import (
     grouped_matmul_blocked_swiglu as _grouped_matmul_blocked_swiglu,
 )
@@ -46,6 +46,7 @@ from max.nn.kernels import (
     grouped_matmul_block_scaled,
     grouped_matmul_ragged,
     grouped_quantize_dynamic_block_scaled,
+    intel_weight_only_nvfp4_matmul,
     layer_norm_quantize_dynamic_scaled_float8,
     quantize_dynamic_block_scaled,
     quantize_dynamic_block_scaled_mxfp4,
@@ -995,6 +996,17 @@ def _matmul_mxfp4(x: Tensor, weight: MXFP4Tensor) -> Tensor:
 
 def _matmul_nvfp4(x: Tensor, weight: NVFP4Tensor) -> Tensor:
     """Block-scaled NVFP4 matmul ``x @ weight.T`` with dynamic activation quant."""
+    if _is_intel_xe2_gpu():
+        # Intel Xe2 weight-only (W4A16): Xe2's DPAS has no FP4 type, so the
+        # activation stays bf16 and `input_scale` cancels. The kernel widens
+        # the weight with its rank-2 [N, K // 16] block scales in registers
+        # and applies `weight_scale_2` to the float32 accumulators. Gated on
+        # Intel Xe2: no other target changes.
+        rows = x.reshape([-1, x.shape[-1]])
+        out = intel_weight_only_nvfp4_matmul(
+            rows, weight.weight, weight.weight_scale, weight.weight_scale_2
+        )
+        return out.reshape([*x.shape[:-1], weight.weight.shape[0]])
     x_fp4, x_scales = quantize_dynamic_block_scaled(
         x,
         tensor_sf=1.0 / weight.input_scale,

@@ -39,6 +39,9 @@ from max.nn._graph_ops import (
     stack_blockwise_fp8_b,
 )
 from max.nn._graph_ops import (
+    _intel_weight_only_block_scaled_float4_matmul as _intel_nvfp4_matmul,
+)
+from max.nn._graph_ops import (
     block_scales_interleave as _block_scales_interleave,
 )
 from max.nn._graph_ops import (
@@ -444,6 +447,9 @@ grouped_dynamic_scaled_fp8_matmul = F.functional(
 block_scales_interleave = F.functional(
     _block_scales_interleave, rule=_nvfp4_interleave_rule
 )
+intel_weight_only_nvfp4_matmul = F.functional(_intel_nvfp4_matmul)
+"""Intel Xe2 weight-only NVFP4 matmul (bf16 activation). No sharding rule:
+call it on single-device tensors."""
 dynamic_block_scaled_matmul = F.functional(
     _dynamic_block_scaled_matmul, rule=_nvfp4_matmul_rule
 )

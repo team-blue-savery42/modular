@@ -26,6 +26,7 @@ from max.nn._graph_ops import (
     _fused_qkv_ragged_matmul_scaled_mxfp6,
     _fused_qkv_ragged_matmul_scaled_mxfp8,
     _grouped_matmul_rowwise_dynamic_scaled_fp8,
+    _intel_weight_only_block_scaled_float4_matmul,
     _intel_weight_only_scaled_float8_matmul,
     _is_amd_gpu,
     _is_apple_gpu,
@@ -141,6 +142,22 @@ def _matmul_float4(
         # the multiply.
         return (res.cast(DType.float32) * weight_scale_2.to(res.device)).cast(
             DType.bfloat16
+        )
+
+    if x.device.is_gpu() and _is_intel_xe2_gpu():
+        # Intel Xe2 weight-only (W4A16) path, as Apple's above: Xe2's DPAS has
+        # no FP4 type, so the activation stays bf16 and the kernel widens the
+        # FP4 weight with its rank-2 [N, K // 16] block scales in registers;
+        # `weight_scale_2` scales the float32 accumulators and `input_scale`
+        # cancels for a bf16 activation. Gated on Intel Xe2: no other target
+        # changes.
+        if scales_pre_interleaved:
+            raise NotImplementedError(
+                "Intel W4A16 path requires rank-2 weight scales"
+                " (scales_pre_interleaved=False)"
+            )
+        return _intel_weight_only_block_scaled_float4_matmul(
+            x, weight, weight_scale.to(x.device), weight_scale_2
         )
 
     x, x_scales = quantize_dynamic_block_scaled(

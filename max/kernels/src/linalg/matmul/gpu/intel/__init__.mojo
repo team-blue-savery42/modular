@@ -16,7 +16,11 @@
 """Intel GPU matmul kernels: DPAS with 2D block I/O on Xe2, a shared-memory
 SIMT GEMM on the GPUs without DPAS."""
 
-from .dispatch import matmul_dispatch_intel, matmul_f8_dispatch_intel
+from .dispatch import (
+    matmul_dispatch_intel,
+    matmul_f4_dispatch_intel,
+    matmul_f8_dispatch_intel,
+)
 from .simt import (
     SIMT_THREADS,
     simt_grid,

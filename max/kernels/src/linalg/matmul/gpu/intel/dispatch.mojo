@@ -52,6 +52,11 @@ from max.gpu.host import DeviceAttribute, DeviceBuffer, DeviceContext
 
 from ....utils import ElementwiseComputeFn, ElementwiseEpilogueFn
 from .matmul import (
+    F4_UNIT,
+    F4_WIDEN_WORDS,
+    f4_widen_kernel,
+    gemm_f4_supported,
+    skinny_kernel_f4,
     SKINNY_MAX_M,
     SKINNY_WIDE_MAX_M,
     SMALL_WG_N,
@@ -479,4 +484,143 @@ def matmul_f8_dispatch_intel(
                 grid_dim=gemm_grid(m, n),
                 block_dim=gemm_block(),
             )
+        return True
+
+
+@inline(.always)
+def matmul_f4_dispatch_intel(
+    c: TileTensor[mut=True, ...],
+    a: TileTensor[DType.bfloat16, ...],
+    b: TileTensor[DType.uint8, ...],
+    scales: TileTensor[DType.float8_e4m3fn, ...],
+    scale: Float32,
+    ctx: DeviceContext,
+) raises -> Bool:
+    """Runs `c = scale * a @ dequant(b)^T` (`b` given as N x K / 2 bytes of
+    E2M1 codes, low nibble first, `scales` as N x K / 16 E4M3 block scales:
+    NVFP4) with an Intel FP4-weight kernel and returns True, or returns
+    False, launching nothing, when the target, layouts or shape aren't the
+    kernels' (the rules of `matmul_dispatch_intel`, and
+    `gemm_f4_supported`).
+
+    Args:
+        c: Output, `(M, N)`, bfloat16 or float32.
+        a: `(M, K)`, bfloat16.
+        b: `(N, K / 2)`, packed E2M1 codes.
+        scales: `(N, K / 16)`, float8_e4m3fn block scales.
+        scale: The weight scale (one per tensor: NVFP4's `weight_scale_2`).
+        ctx: Device context to launch on.
+
+    Returns:
+        Whether the matmul was launched.
+    """
+    comptime info = ctx.default_device_info
+    comptime c_type = c.dtype
+    comptime taken = (
+        info.api == "level_zero"
+        and info.version == "xe2"
+        and info.warp_size == 16
+        and (c_type == DType.float32 or c_type == DType.bfloat16)
+        and c.address_space == AddressSpace.GENERIC
+        and a.address_space == AddressSpace.GENERIC
+        and b.address_space == AddressSpace.GENERIC
+        and scales.address_space == AddressSpace.GENERIC
+    )
+    comptime if not taken:
+        return False
+    else:
+        var m = Int(c.dim[0]())
+        var n = Int(c.dim[1]())
+        var k = Int(a.dim[1]())
+        if not (
+            gemm_f4_supported[c_type](m, n, k)
+            and Int(b.dim[0]()) == n
+            and Int(b.dim[1]()) * 2 == k
+            and Int(scales.dim[0]()) == n
+            and Int(scales.dim[1]()) * 16 == k
+            and _row_major(c)
+            and _row_major(a)
+            and _row_major(b)
+            and _row_major(scales)
+        ):
+            return False
+        var cp = _raw(c)
+        var ap = _raw(a)
+        var bp = _raw(b)
+        var sp = _raw(scales).unsafe_bitcast[UInt8]()
+        var f4_scale = scale * F4_UNIT
+        if m <= SKINNY_MAX_M:
+            if n > F8_SKINNY_KS16_MAX_N:
+                comptime kern = skinny_kernel_f4[c_type, ks=8]
+                ctx.enqueue_function[kern](
+                    cp,
+                    ap,
+                    bp,
+                    sp,
+                    Int64(m),
+                    Int64(n),
+                    Int64(k),
+                    f4_scale,
+                    grid_dim=skinny_grid(n),
+                    block_dim=skinny_block[8](),
+                )
+            else:
+                comptime kern = skinny_kernel_f4[c_type, ks=16]
+                ctx.enqueue_function[kern](
+                    cp,
+                    ap,
+                    bp,
+                    sp,
+                    Int64(m),
+                    Int64(n),
+                    Int64(k),
+                    f4_scale,
+                    grid_dim=skinny_grid(n),
+                    block_dim=skinny_block[16](),
+                )
+            return True
+        # Widen B^T once to bfloat16 (values times their block scale /
+        # 2**22), then the FP8 path's bfloat16 GEMM with the scale; the
+        # scratch copy is freed after the GEMM runs.
+        var wide = ctx.enqueue_create_buffer[DType.bfloat16](n * k)
+        var wp = _raw_buf(wide)
+        comptime widen_block = 256
+        ctx.enqueue_function[f4_widen_kernel](
+            wp,
+            bp,
+            sp,
+            Int64(n * k),
+            grid_dim=ceildiv(n * k, 8 * F4_WIDEN_WORDS * widen_block),
+            block_dim=widen_block,
+        )
+        var xe_cores = ctx.device().get_attribute(
+            DeviceAttribute.MULTIPROCESSOR_COUNT
+        )
+        if gemm_small_tiles(m, n, xe_cores):
+            comptime kern = gemm_kernel_f8_widened[c_type, SMALL_WG_N]
+            ctx.enqueue_function[kern](
+                cp,
+                ap,
+                wp,
+                Int64(m),
+                Int64(n),
+                Int64(k),
+                f4_scale,
+                grid_dim=gemm_grid[256, SMALL_WG_N](m, n),
+                block_dim=gemm_block[256, SMALL_WG_N](),
+            )
+        else:
+            comptime kern = gemm_kernel_f8_widened[c_type]
+            ctx.enqueue_function[kern](
+                cp,
+                ap,
+                wp,
+                Int64(m),
+                Int64(n),
+                Int64(k),
+                f4_scale,
+                grid_dim=gemm_grid(m, n),
+                block_dim=gemm_block(),
+            )
+        _ = wide^
         return True

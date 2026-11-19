@@ -69,7 +69,10 @@ from linalg.matmul.gpu.amd.smallm_streaming_matmul import (
 )
 from linalg.matmul.gpu.apple.fp4_matmul import enqueue_apple_fp4_matmul
 from linalg.matmul.gpu.apple.fp8_gemv import enqueue_apple_fp8_matmul
-from linalg.matmul.gpu.intel import matmul_f8_dispatch_intel
+from linalg.matmul.gpu.intel import (
+    matmul_f4_dispatch_intel,
+    matmul_f8_dispatch_intel,
+)
 from linalg.matmul.gpu.apple.int8_matmul import (
     enqueue_apple_int8_matmul,
     enqueue_apple_int8_quantize_activation,
@@ -2276,6 +2279,58 @@ struct Struct_matmul_weight_only_scaled_float8_apple:
             b.to_tile_tensor[.float8_e4m3fn](),
             context,
         )
+
+
+@extensibility.register("mo.matmul.weight.only.block.scaled.float4.intel")
+struct Struct_matmul_weight_only_block_scaled_float4_intel:
+    """Intel weight-only NVFP4 (W4A16) matmul: `out = (a @ dequant(b)^T) *
+    weight_scale_2`.
+
+    The Intel sibling of the Apple M5 NVFP4 path: Xe2's DPAS has no FP4
+    type, so the activation `a` stays bf16 and the packed E2M1 weight `b`
+    (`(N, K / 2)`, low nibble first) is widened with its float8_e4m3fn
+    block scales (`(N, K / 16)`) to bf16 (`linalg.matmul.gpu.intel`'s FP4
+    kernels); the per-tensor `weight_scale_2` (a CPU scalar) is applied to
+    the float32 accumulators, and `input_scale` cancels for a bf16
+    activation, so it is not an input.
+    """
+
+    @inline(.always)
+    @staticmethod
+    def execute[
+        scale_type: DType,
+    ](
+        c: Some[Output & Tensor],
+        a: Some[Input & Tensor],
+        b: Some[Input & Tensor],
+        scales: Some[Input & Tensor],
+        weight_scale_2: Scalar[scale_type],
+        context: DeviceContext,
+    ) raises:
+        comptime assert conforms_to(type_of(c), TileTensorable)
+        comptime assert conforms_to(type_of(a), TileTensorable)
+        comptime assert conforms_to(type_of(b), TileTensorable)
+        comptime assert conforms_to(type_of(scales), TileTensorable)
+        comptime assert (
+            context.target.is_gpu()
+        ), "Intel weight-only NVFP4 matmul only supports GPUs"
+        comptime assert context.default_device_info.api == "level_zero", (
+            "mo.matmul.weight.only.block.scaled.float4.intel requires an"
+            " Intel (Level Zero) GPU accelerator"
+        )
+        if not matmul_f4_dispatch_intel(
+            c.to_tile_tensor(),
+            a.to_tile_tensor[.bfloat16](),
+            b.to_tile_tensor[.uint8](),
+            scales.to_tile_tensor[.float8_e4m3fn](),
+            weight_scale_2.cast[DType.float32](),
+            context,
+        ):
+            raise Error(
+                "mo.matmul.weight.only.block.scaled.float4.intel: shape or"
+                " layout not supported (N a multiple of 8, N >= 32, K a"
+                " multiple of 64, K >= 128, row-major tensors)"
+            )
 
 
 @extensibility.register("mo.matmul.weight.only.scaled.float8.intel")
