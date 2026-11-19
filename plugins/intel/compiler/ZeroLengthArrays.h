@@ -55,8 +55,11 @@ bool containsZeroLengthArray(llvm::Type *type);
 /// holds a zero-length array, the kernel's `extractvalue`s of it read the
 /// leaves, and any other use is an error that changes nothing (the original
 /// value has no SPIR-V form); otherwise the original value is rebuilt from the
-/// leaves at the kernel's entry, for any use. Run on the optimized module.
-/// Returns whether anything changed.
+/// leaves at the kernel's entry, for any use. A parameter passed in memory
+/// (`byval`) whose struct holds a zero-length array keeps its pointer and
+/// gets the struct of the leaves as its `byval` type, with the original
+/// alignment: the kernel reads the same bytes through it. Run on the
+/// optimized module. Returns whether anything changed.
 llvm::Expected<bool> rewriteArrayParameters(llvm::Module &module);
 
 } // namespace M::KGEN::Intel

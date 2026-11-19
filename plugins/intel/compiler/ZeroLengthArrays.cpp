@@ -245,10 +245,42 @@ void rewriteExtracts(Value *value, Path &path, Value *param,
   }
 }
 
+/// Gives each kernel parameter passed in memory (`byval`) whose struct holds
+/// a zero-length array the struct of its leaves (`flatten`) as its `byval`
+/// type, with the original's alignment: the same bytes at the same offsets,
+/// which the kernel reads through the pointer. Returns whether any changed.
+bool retypeByValParameters(Module &module) {
+  const DataLayout &layout = module.getDataLayout();
+  LLVMContext &ctx = module.getContext();
+  bool changed = false;
+  for (Function &func : module) {
+    if (func.getCallingConv() != CallingConv::SPIR_KERNEL ||
+        func.isDeclaration())
+      continue;
+    for (Argument &arg : func.args()) {
+      if (!arg.hasByValAttr() ||
+          !containsZeroLengthArray(arg.getParamByValType()))
+        continue;
+      Type *original = arg.getParamByValType();
+      Align align =
+          arg.getParamAlign().value_or(layout.getABITypeAlign(original));
+      unsigned index = arg.getArgNo();
+      func.removeParamAttr(index, Attribute::ByVal);
+      func.removeParamAttr(index, Attribute::Alignment);
+      func.addParamAttr(index, Attribute::getWithByValType(
+                                   ctx, flatten(layout, original).type));
+      func.addParamAttr(index, Attribute::getWithAlignment(ctx, align));
+      changed = true;
+    }
+  }
+  return changed;
+}
+
 } // namespace
 
 Expected<bool> rewriteArrayParameters(Module &module) {
   const DataLayout &layout = module.getDataLayout();
+  bool retyped = retypeByValParameters(module);
   SmallVector<Function *> kernels;
   for (Function &func : module)
     if (func.getCallingConv() == CallingConv::SPIR_KERNEL &&
@@ -311,7 +343,7 @@ Expected<bool> rewriteArrayParameters(Module &module) {
     kernel->replaceAllUsesWith(copy);
     kernel->eraseFromParent();
   }
-  return !kernels.empty();
+  return retyped || !kernels.empty();
 }
 
 } // namespace M::KGEN::Intel

@@ -305,6 +305,47 @@ define spir_kernel void @k({ i32, [0 x i64] } %arg) {
             std::string::npos);
 }
 
+// A struct passed in memory (MAX's rowwise kernels take one whose index
+// list is empty): { i64 @0, [0 x { i32, i1 }] @8, ptr @8, i32 @16 }, 24
+// bytes, read through the pointer by byte offset. Its `byval` type becomes
+// { i64, ptr, i32, i8 x 4 }, aligned as the original (8), so SPIR-V gets no
+// runtime array.
+TEST(ZeroLengthArraysTest, ByValStructsLoseTheirZeroLengthArrays) {
+  LLVMContext ctx;
+  std::unique_ptr<Module> module = parse(ctx, R"(
+define spir_kernel void @k(ptr byval({ i64, [0 x { i32, i1 }], ptr addrspace(1), i32 }) %arg) {
+  %pp = getelementptr inbounds i8, ptr %arg, i64 8
+  %p = load ptr addrspace(1), ptr %pp, align 8
+  %np = getelementptr inbounds i8, ptr %arg, i64 16
+  %n = load i32, ptr %np, align 4
+  store i32 %n, ptr addrspace(1) %p, align 4
+  ret void
+}
+)");
+  ASSERT_TRUE(module);
+  Expected<bool> changed = rewriteArrayParameters(*module);
+  ASSERT_TRUE(static_cast<bool>(changed)) << toString(changed.takeError());
+  EXPECT_TRUE(*changed);
+  ASSERT_EQ(verify(*module), "") << print(*module);
+
+  Function *kernel = module->getFunction("k");
+  ASSERT_NE(kernel, nullptr);
+  Argument *arg = kernel->getArg(0);
+  ASSERT_TRUE(arg->hasByValAttr());
+  Type *byVal = arg->getParamByValType();
+  EXPECT_FALSE(containsZeroLengthArray(byVal)) << print(*module);
+  const DataLayout &layout = module->getDataLayout();
+  EXPECT_EQ(layout.getTypeAllocSize(byVal), 24u);
+  const StructLayout *fields = layout.getStructLayout(cast<StructType>(byVal));
+  EXPECT_EQ(fields->getElementOffset(1), 8u);
+  EXPECT_EQ(fields->getElementOffset(2), 16u);
+  EXPECT_EQ(arg->getParamAlign().valueOrOne().value(), 8u);
+
+  std::string spirv = emitSPIRV(*module);
+  EXPECT_EQ(spirv.find("OpTypeRuntimeArray"), std::string::npos) << spirv;
+  EXPECT_NE(spirv.find("OpEntryPoint Kernel"), std::string::npos) << spirv;
+}
+
 TEST(ZeroLengthArraysTest, LeavesOtherKernelsAlone) {
   LLVMContext ctx;
   std::unique_ptr<Module> module = parse(ctx, R"(
