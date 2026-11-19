@@ -405,7 +405,11 @@ struct CompilationTarget[_mlir_value: _TargetType = _current_target(), //](
                 "+SPV_INTEL_2d_block_io,"
                 # Split work-group barriers (arrive, then wait), which the
                 # driver lists.
-                "+SPV_INTEL_split_barrier"
+                "+SPV_INTEL_split_barrier,"
+                # Sub-group shuffles and block reads and writes, including of
+                # shared local memory (cl_intel_subgroups,
+                # cl_intel_subgroup_local_block_io), which the driver lists.
+                "+SPV_INTEL_subgroups"
             )
         else:
             return ""
