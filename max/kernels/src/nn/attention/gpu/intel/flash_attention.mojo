@@ -108,9 +108,42 @@ def prefill_rows[depth: Int]() -> Int:
 
 def prefill_bq[depth: Int]() -> Int:
     """Queries of one head per prefill work-group: 64 up to head dim 128 (8%
-    faster at 4,096 tokens than 32 with 8-row sub-groups), else
-    `BQ` (the work-group would pass 1,024 work-items)."""
+    faster at 4,096 tokens than 32 with 8-row sub-groups), `BQ` up to 256
+    (the work-group would pass 1,024 work-items), 8 above (each query row
+    block takes `out_splits` sub-groups; Level Zero refused 1,024 work-items
+    for that kernel on the B70)."""
+    comptime if depth > 256:
+        return 8
     return BQ if depth > 128 else get_defined_int["intel_fa_prefill_bq", 64]()
+
+
+comptime MAX_OUT_DEPTH = 256
+"""Most head dims of O a sub-group keeps in registers (64 floats per
+work-item at `ROWS` rows; twice that spilled, see the module notes)."""
+
+
+def out_splits[depth: Int]() -> Int:
+    """Sub-groups that share a row block's O by head dims: 1 up to
+    `MAX_OUT_DEPTH`, else depth / `MAX_OUT_DEPTH` (each recomputes the
+    scores, which need the whole head dimension)."""
+    return ceildiv(depth, MAX_OUT_DEPTH)
+
+
+def head_splits[group: Int]() -> Int:
+    """Decode sub-groups that share a KV head's `group` query heads, `ROWS`
+    each."""
+    return ceildiv(group, ROWS)
+
+
+def prefill_block[depth: Int, group: Int]() -> Int:
+    """Work-items of a prefill work-group."""
+    return (
+        prefill_bq[depth]()
+        // prefill_rows[depth]()
+        * group
+        * out_splits[depth]()
+        * WARP_SIZE
+    )
 
 
 comptime DECODE_SPLIT = get_defined_int["intel_fa_split", 32]()
@@ -162,9 +195,10 @@ def intel_fa_supported[
         and kv_dtype == dtype
         and depth % 32 == 0
         and depth >= 32
-        and depth <= 256
+        and (depth <= MAX_OUT_DEPTH or depth % MAX_OUT_DEPTH == 0)
+        and depth <= 2 * MAX_OUT_DEPTH
         and group >= 1
-        and group <= ROWS
+        and prefill_block[depth, group]() <= (512 if depth > 256 else 1024)
         and page_size > 0
         and page_size % BN == 0
     )
@@ -173,14 +207,16 @@ def intel_fa_supported[
 @inline(.always)
 def _load_v[
     depth: Int, kv_pitch: Int, dtype: DType, j: Int
-](addr: UInt64, rows: Int) -> SIMD[dtype, 32]:
+](addr: UInt64, rows: Int, col0: Int) -> SIMD[dtype, 32]:
     """V's fragment j of 16 keys: lane n holds head dims 32 j + n and
     32 j + 16 + n, VNNI-packed: two B operands."""
     var vp = MutPointer[Scalar[dtype], MutAnyOrigin](
         unsafe_from_address=Int(addr)
     )
     return rebind[SIMD[dtype, 32]](
-        block_load_transform[16, 16, 2](vp, depth, rows, kv_pitch, 32 * j, 0)
+        block_load_transform[16, 16, 2](
+            vp, depth, rows, kv_pitch, col0 + 32 * j, 0
+        )
     )
 
 
@@ -196,6 +232,7 @@ def _attend[
     QR: Int = ROWS,
     COOP: Bool = False,
     PIPE: Bool = False,
+    OD: Int = depth,
 ](
     o: MutPointer[Scalar[DType.float32], _, address_space=AddressSpace.LOCAL],
     mut m: SIMD[DType.float32, QR],
@@ -219,6 +256,7 @@ def _attend[
     num_keys: Int,
     scale: Float32,
     pf_id: Int = 0,
+    od0: Int = 0,
 ):
     """Attends this sub-group's `QR` rows to keys [`key_begin`, `key_end`)
     (of `num_keys` in the sequence): updates the running output `o` (depth /
@@ -233,10 +271,14 @@ def _attend[
     `pf_id` of its work-group issues only the prefetches whose block number
     is `pf_id` modulo the number of blocks of a step (the others' share). With
     `PIPE` the loads of a step are issued ahead of their DPAS (prefill; the
-    decode kernel's 4 rows ran slower so)."""
+    decode kernel's 4 rows ran slower so). `o` holds head dims [`od0`, `od0`
+    + `OD`) of O only (the scores take all `depth`), so that sub-groups
+    splitting a wide head share its output."""
     comptime KS = depth // 16  # DPAS K steps over the head dimension
     comptime NT = BN // 16  # 16-key column tiles per step
     comptime KK = KS // 2  # steps of 32 head dims
+    comptime OKS = OD // 16  # DPAS tiles of O
+    comptime OKK = OD // 32  # steps of 32 head dims of O
     comptime causal = mask_t == CausalMask
     var lane = Int(lane_id())
     var kv0 = key_begin
@@ -276,7 +318,7 @@ def _attend[
         # step's K rows into the cache (10-13% faster prefill, measured).
         # With COOP the sub-groups of a work-group share the work: each takes
         # the blocks whose index is its own, modulo the number of blocks.
-        comptime NB = 2 * NT * (depth // 32)
+        comptime NB = NT * (OD // 32) + NT * (depth // 32)
         comptime for t in range(NT):
             var key0 = kv0 + 16 * t
             if key0 < num_keys:
@@ -284,11 +326,11 @@ def _attend[
                     unsafe_from_address=Int(vaddr[t])
                 )
                 var rows = min(16, num_keys - key0)
-                comptime for c in range(depth // 32):
-                    comptime bi = t * (depth // 32) + c
+                comptime for c in range(OD // 32):
+                    comptime bi = t * (OD // 32) + c
                     if not COOP or pf_id % NB == bi:
                         block_prefetch[16, 16, 2](
-                            vp, depth, rows, kv_pitch, 32 * c, 0
+                            vp, depth, rows, kv_pitch, od0 + 32 * c, 0
                         )
             var nkey0 = kv0 + BN + 16 * t
             if nkey0 < key_end:
@@ -297,7 +339,7 @@ def _attend[
                 )
                 var rows = min(16, num_keys - nkey0)
                 comptime for c in range(depth // 32):
-                    comptime bi = NT * (depth // 32) + t * (depth // 32) + c
+                    comptime bi = NT * (OD // 32) + t * (depth // 32) + c
                     if not COOP or pf_id % NB == bi:
                         block_prefetch[16, 16, 2](
                             kp, depth, rows, kv_pitch, 32 * c, 0
@@ -308,7 +350,7 @@ def _attend[
         ]()
         comptime for t in range(NT):
             s.unsafe_store(QR * t, SIMD[DType.float32, QR](0))
-        comptime NU = NT * KK
+        comptime NU = NT * OKK
         var vs = stack_allocation[
             2 * 32, dtype, address_space=AddressSpace.LOCAL
         ]()
@@ -374,7 +416,7 @@ def _attend[
             vs.unsafe_store(
                 0,
                 _load_v[depth, kv_pitch, dtype, 0](
-                    vaddr[0], max(1, min(16, num_keys - kv0))
+                    vaddr[0], max(1, min(16, num_keys - kv0)), od0
                 ),
             )
         else:
@@ -451,7 +493,7 @@ def _attend[
             var alpha = exp2(m - m_new)
             m = m_new
             l *= alpha
-            comptime for j in range(KS):
+            comptime for j in range(OKS):
                 o.unsafe_store(QR * j, o.unsafe_load[width=QR](QR * j) * alpha)
         comptime if PIPE:
             var ps = stack_allocation[
@@ -474,16 +516,17 @@ def _attend[
                 comptime if u + 1 < NU:
                     vs.unsafe_store(
                         (1 - par) * 32,
-                        _load_v[depth, kv_pitch, dtype, (u + 1) % KK](
-                            vaddr[(u + 1) // KK],
+                        _load_v[depth, kv_pitch, dtype, (u + 1) % OKK](
+                            vaddr[(u + 1) // OKK],
                             max(
                                 1,
-                                min(16, num_keys - kv0 - 16 * ((u + 1) // KK)),
+                                min(16, num_keys - kv0 - 16 * ((u + 1) // OKK)),
                             ),
+                            od0,
                         ),
                     )
-                comptime t = u // KK
-                comptime j = u % KK
+                comptime t = u // OKK
+                comptime j = u % OKK
                 var vb = vs.unsafe_load[width=32](par * 32)
                 var pa = ps.unsafe_load[width=QR](QR * t)
                 comptime for h in range(2):
@@ -512,12 +555,12 @@ def _attend[
                         unsafe_from_address=Int(vaddr[t])
                     )
                     var rows = min(16, num_keys - key0)
-                    comptime for j in range(KS // 2):
-                        # Lane n: head dims 32 j + n and 32 j + 16 + n of the
-                        # 16 keys, VNNI-packed: two B operands.
+                    comptime for j in range(OKK):
+                        # Lane n: head dims od0 + 32 j + n and od0 + 32 j +
+                        # 16 + n of the 16 keys, VNNI-packed: two B operands.
                         var vb = rebind[SIMD[dtype, 32]](
                             block_load_transform[16, 16, 2](
-                                vp, depth, rows, kv_pitch, 32 * j, 0
+                                vp, depth, rows, kv_pitch, od0 + 32 * j, 0
                             )
                         )
                         comptime for h in range(2):
@@ -573,12 +616,18 @@ def intel_fa_prefill_kernel[
     scale: Float32,
 ):
     """Prefill: grid (ceildiv(max queries, prefill_bq), KV heads, sequences),
-    `prefill_bq / prefill_rows[depth]() * group` sub-groups of 16."""
+    `prefill_bq / prefill_rows[depth]() * group * out_splits[depth]()`
+    sub-groups of 16 (`prefill_block`)."""
     comptime kv_heads = num_heads // group
     comptime kv_pitch = kv_heads * depth
-    comptime KS = depth // 16
+    comptime DS = out_splits[depth]()
+    comptime OD = depth // DS
+    comptime KS = OD // 16
     comptime PR = prefill_rows[depth]()
-    var sg = Int(thread_idx.x) // WARP_SIZE
+    var sg_all = Int(thread_idx.x) // WARP_SIZE
+    # Sub-groups DS apart share a row block, each its head dims od0 + [0, OD).
+    var od0 = (sg_all % DS) * OD
+    var sg = sg_all // DS
     var batch = Int(block_idx.z)
     var kv_head = Int(block_idx.y)
     var head = kv_head * group + sg % group
@@ -608,7 +657,7 @@ def intel_fa_prefill_kernel[
         o.unsafe_store(PR * j, SIMD[DType.float32, PR](0))
     var m = SIMD[DType.float32, PR](NEG_INF)
     var l = SIMD[DType.float32, PR](0)
-    _attend[depth, kv_pitch, PR, True, True](
+    _attend[depth, kv_pitch, PR, True, True, OD](
         o,
         m,
         l,
@@ -631,12 +680,13 @@ def intel_fa_prefill_kernel[
         num_keys,
         scale,
         sg,
+        od0,
     )
     var inv = 1.0 / lane_group_sum[16](l)
     comptime for j in range(KS):
         var out = (o.unsafe_load[width=PR](PR * j) * inv).cast[dtype]()
         block_store[16, PR](
-            o_base, depth, rows, num_heads * depth, 16 * j, 0, out
+            o_base, depth, rows, num_heads * depth, od0 + 16 * j, 0, out
         )
 
 
@@ -660,16 +710,24 @@ def intel_fa_decode_kernel[
     scale: Float32,
     num_splits: Int32,
 ):
-    """Decode (one query per sequence): grid (splits, KV heads, sequences),
-    one sub-group of `decode_split_keys` keys. Writes split `s`'s
+    """Decode (one query per sequence): grid (splits, KV heads x
+    `head_splits[group]()` x `out_splits[depth]()`, sequences), one sub-group
+    of `decode_split_keys` keys, `ROWS` of the KV head's query heads and
+    depth / `out_splits` head dims of their output. Writes split `s`'s
     unnormalised output of head h to
     `o_part[((batch * num_heads + h) * splits + s) * depth + d]` and its row
     max and lane-summed row sum to `ml_part[2 * (...) + 0/1]`."""
     comptime kv_heads = num_heads // group
     comptime kv_pitch = kv_heads * depth
-    comptime KS = depth // 16
+    comptime DS = out_splits[depth]()
+    comptime HS = head_splits[group]()
+    comptime OD = depth // DS
+    comptime KS = OD // 16
     var split = Int(block_idx.x)
-    var kv_head = Int(block_idx.y)
+    var y = Int(block_idx.y)
+    var od0 = (y % DS) * OD
+    var hs = (y // DS) % HS
+    var kv_head = y // (DS * HS)
     var batch = Int(block_idx.z)
     var splits = Int(num_splits)
     var b = _seq_bounds[_is_cache_length_accurate](k, row_offsets, batch)
@@ -682,7 +740,10 @@ def intel_fa_decode_kernel[
         return
     var key_end = min(num_keys, key_begin + split_keys)
     var pos = num_keys - 1
-    var q_base = q + (seq_start * num_heads + kv_head * group) * depth
+    # This sub-group's query heads: head0 .. head0 + heads - 1.
+    var head0 = kv_head * group + hs * ROWS
+    var heads = min(ROWS, group - hs * ROWS)
+    var q_base = q + (seq_start * num_heads + head0) * depth
 
     var o = stack_allocation[
         KS * ROWS, DType.float32, address_space=AddressSpace.LOCAL
@@ -691,19 +752,19 @@ def intel_fa_decode_kernel[
         o.unsafe_store(ROWS * j, SIMD[DType.float32, ROWS](0))
     var m = SIMD[DType.float32, ROWS](NEG_INF)
     var l = SIMD[DType.float32, ROWS](0)
-    _attend[depth, kv_pitch](
+    _attend[depth, kv_pitch, OD=OD](
         o,
         m,
         l,
         q_base,
-        group,
+        heads,
         depth,
         k,
         v,
         mask,
         batch,
         kv_head,
-        kv_head * group,
+        head0,
         1,
         pos,
         0,
@@ -713,18 +774,21 @@ def intel_fa_decode_kernel[
         key_end,
         num_keys,
         scale,
+        od0=od0,
     )
     var lsum = lane_group_sum[16](l)
     var lane = Int(lane_id())
-    comptime for r in range(group):
-        var idx = (batch * num_heads + kv_head * group + r) * splits + split
-        comptime for j in range(KS):
-            o_part[idx * depth + 16 * j + lane] = o.unsafe_load[width=ROWS](
-                ROWS * j
-            )[r]
-        if lane == 0:
-            ml_part[2 * idx] = m[r]
-            ml_part[2 * idx + 1] = lsum[r]
+    comptime for r in range(ROWS):
+        if r < heads:
+            var idx = (batch * num_heads + head0 + r) * splits + split
+            comptime for j in range(KS):
+                o_part[idx * depth + od0 + 16 * j + lane] = o.unsafe_load[
+                    width=ROWS
+                ](ROWS * j)[r]
+            # The out splits' maxima and sums are the same: one writes them.
+            if lane == 0 and od0 == 0:
+                ml_part[2 * idx] = m[r]
+                ml_part[2 * idx + 1] = lsum[r]
 
 
 def intel_fa_decode_stitch[
@@ -861,7 +925,11 @@ def intel_flash_attention[
             offs,
             scale,
             Int32(splits),
-            grid_dim=(splits, kv_heads, batch_size),
+            grid_dim=(
+                splits,
+                kv_heads * head_splits[group]() * out_splits[depth](),
+                batch_size,
+            ),
             block_dim=WARP_SIZE,
         )
         comptime stitch = intel_fa_decode_stitch[
@@ -902,8 +970,5 @@ def intel_flash_attention[
                 kv_heads,
                 batch_size,
             ),
-            block_dim=prefill_bq[depth]()
-            // prefill_rows[depth]()
-            * group
-            * WARP_SIZE,
+            block_dim=prefill_block[depth, group](),
         )

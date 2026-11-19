@@ -34,7 +34,8 @@ attention ops chained (each op's output is the next op's Q), executions back
 to back; per op = (t9 - t1) / 8, which removes the graph's per-execution
 cost; decode (one query after 511 cached) and prefill 512, 2048
 (ATTN_TIME_PROMPTS overrides the prefill lengths). ATTN_SHAPE=qwen3-8b uses
-Qwen3-8B's heads.
+Qwen3-8B's heads, ATTN_SHAPE=gemma4-global Gemma-4-26B-A4B's full-attention
+layers' (head dim 512, GQA 8).
 """
 
 from __future__ import annotations
@@ -72,8 +73,12 @@ from test_common.simple_kv_cache import (
 
 # ATTN_SHAPE=qwen3-8b: Qwen3-8B's attention, 32 query heads over 8
 # KV heads (GQA 4), head dim 128, page 128, scale 1/sqrt(128).
+# ATTN_SHAPE=gemma4-global: Gemma-4-26B-A4B's full-attention layers, 16
+# query heads over 2 KV heads (GQA 8), head dim 512, page 128.
 if os.environ.get("ATTN_SHAPE") == "qwen3-8b":
     NQ, NKV, HD, PAGE = 32, 8, 128, 128
+elif os.environ.get("ATTN_SHAPE") == "gemma4-global":
+    NQ, NKV, HD, PAGE = 16, 2, 512, 128
 else:
     NQ, NKV, HD, PAGE = 8, 2, 256, 256
 BF = DType.bfloat16
