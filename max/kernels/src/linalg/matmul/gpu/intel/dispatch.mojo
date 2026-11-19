@@ -500,7 +500,7 @@ def matmul_f8_dispatch_intel(
 
 @inline(.always)
 def _launch_skinny_f4[
-    c_type: DType, ks: Int
+    c_type: DType, ks: Int, sg_m: Int = 16
 ](
     ctx: DeviceContext,
     c: MutPointer[Scalar[c_type], MutAnyOrigin],
@@ -512,8 +512,9 @@ def _launch_skinny_f4[
     k: Int,
     scale: Float32,
 ) raises:
-    """Launches `skinny_kernel_f4` with `ks` sub-groups per work-group."""
-    comptime kern = skinny_kernel_f4[c_type, ks=ks]
+    """Launches `skinny_kernel_f4` with `ks` sub-groups per work-group and
+    `sg_m` rows of A per DPAS tile."""
+    comptime kern = skinny_kernel_f4[c_type, sg_m=sg_m, ks=ks]
     ctx.enqueue_function[kern](
         c,
         a,
@@ -590,6 +591,17 @@ def matmul_f4_dispatch_intel(
         var bp = _raw(b)
         var sp = _raw(scales).unsafe_bitcast[UInt8]()
         var f4_scale = scale * F4_UNIT
+        if m <= 8:
+            # One DPAS row block: half the A loads and DPAS calls of 16.
+            if n > F4_SKINNY_SPLIT_N:
+                _launch_skinny_f4[c_type, F4_SKINNY_KS_WIDE, 8](
+                    ctx, cp, ap, bp, sp, m, n, k, f4_scale
+                )
+            else:
+                _launch_skinny_f4[c_type, F4_SKINNY_KS_NARROW, 8](
+                    ctx, cp, ap, bp, sp, m, n, k, f4_scale
+                )
+            return True
         if m <= SKINNY_MAX_M:
             if n > F4_SKINNY_SPLIT_N:
                 _launch_skinny_f4[c_type, F4_SKINNY_KS_WIDE](
