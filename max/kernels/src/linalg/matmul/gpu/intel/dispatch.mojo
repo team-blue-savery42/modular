@@ -45,6 +45,7 @@ scratch copy and runs `gemm_kernel_f8_widened` in the GEMM's tile classes.
 """
 
 from std.math import ceildiv
+from std.os import getenv
 from std.memory.address_space import AddressSpace
 
 from layout import TileTensor
@@ -57,6 +58,9 @@ from .matmul import (
     f4_widen_kernel,
     gemm_f4_supported,
     grouped_kernel_f4,
+    gemm_kernel_wide,
+    WIDE_F8,
+    WIDE_NVFP4,
     skinny_kernel_f4,
     SKINNY_MAX_M,
     SKINNY_WIDE_MAX_M,
@@ -454,6 +458,10 @@ def matmul_f8_dispatch_intel(
                     block_dim=skinny_block[16](),
                 )
             return True
+        if k % 32 == 0 and m <= _wide_max_m(WIDE_MAX_M_F8):
+            var b8 = bp.unsafe_bitcast[UInt8]()
+            _launch_wide[c_type, WIDE_F8](ctx, cp, ap, b8, b8, m, n, k, scale)
+            return True
         # Widen B^T once to bfloat16 (values / 256), then the bfloat16 GEMM
         # with the scale; the scratch copy is freed after the GEMM runs
         # (frees wait for the queue's earlier work).
@@ -528,6 +536,106 @@ def _launch_skinny_f4[
         grid_dim=skinny_grid(n),
         block_dim=skinny_block[ks](),
     )
+
+
+comptime WIDE_MAX_M_F8 = 512
+"""Largest M for which the FP8 weight GEMM widens B^T per K step in shared
+local memory (`gemm_kernel_wide`) instead of into a bfloat16 copy first.
+Measured on the B70 at Gemma-4-26B-A4B's projections (six shapes), fused /
+widened time: M 32 0.48-0.83, 128 0.44-0.75, 512 0.64-0.92, 1024
+0.87-1.11, 2048 0.86-1.28, 4096 0.98-1.42."""
+
+comptime WIDE_MAX_M_F4 = 0
+"""The same for the NVFP4 weight GEMM: none. At Qwen3.5-4B's MLP the fused
+kernel took 0.80-1.02 of the widened time for gate and up (18432 x 2560) at
+M 32-512 but 1.18-1.43 for down (2560 x 9216), and more at larger M."""
+
+
+def _wide_max_m(default: Int) -> Int:
+    """`default`, or `MOJO_INTEL_WIDE_MAX_M` when set (for measuring)."""
+    var v = getenv("MOJO_INTEL_WIDE_MAX_M")
+    if v:
+        try:
+            return Int(v)
+        except:
+            pass
+    return default
+
+
+@inline(.always)
+def _launch_wide[
+    c_type: DType, fmt: Int
+](
+    ctx: DeviceContext,
+    c: MutPointer[Scalar[c_type], MutAnyOrigin],
+    a: MutPointer[Scalar[DType.bfloat16], MutAnyOrigin],
+    b: MutPointer[Scalar[DType.uint8], MutAnyOrigin],
+    scales: MutPointer[Scalar[DType.uint8], MutAnyOrigin],
+    m: Int,
+    n: Int,
+    k: Int,
+    scale: Float32,
+) raises:
+    """Launches `gemm_kernel_wide` in the bfloat16 GEMM's tile classes:
+    256 x `SMALL_WG_N` work-groups when 256 x 256 ones wouldn't fill the
+    Xe-cores (`gemm_small_tiles`)."""
+    var xe_cores = ctx.device().get_attribute(
+        DeviceAttribute.MULTIPROCESSOR_COUNT
+    )
+    if k % 64 == 0:
+        _launch_wide_k[c_type, fmt, 2](
+            ctx, c, a, b, scales, m, n, k, scale, xe_cores
+        )
+    else:
+        _launch_wide_k[c_type, fmt, 1](
+            ctx, c, a, b, scales, m, n, k, scale, xe_cores
+        )
+
+
+@inline(.always)
+def _launch_wide_k[
+    c_type: DType, fmt: Int, kstep: Int
+](
+    ctx: DeviceContext,
+    c: MutPointer[Scalar[c_type], MutAnyOrigin],
+    a: MutPointer[Scalar[DType.bfloat16], MutAnyOrigin],
+    b: MutPointer[Scalar[DType.uint8], MutAnyOrigin],
+    scales: MutPointer[Scalar[DType.uint8], MutAnyOrigin],
+    m: Int,
+    n: Int,
+    k: Int,
+    scale: Float32,
+    xe_cores: Int,
+) raises:
+    """`_launch_wide` with `kstep` K steps per barrier."""
+    if gemm_small_tiles(m, n, xe_cores):
+        comptime kern = gemm_kernel_wide[c_type, fmt, SMALL_WG_N, kstep]
+        ctx.enqueue_function[kern](
+            c,
+            a,
+            b,
+            scales,
+            Int64(m),
+            Int64(n),
+            Int64(k),
+            scale,
+            grid_dim=gemm_grid[256, SMALL_WG_N](m, n),
+            block_dim=gemm_block[256, SMALL_WG_N](),
+        )
+    else:
+        comptime kern = gemm_kernel_wide[c_type, fmt, kstep=kstep]
+        ctx.enqueue_function[kern](
+            c,
+            a,
+            b,
+            scales,
+            Int64(m),
+            Int64(n),
+            Int64(k),
+            scale,
+            grid_dim=gemm_grid(m, n),
+            block_dim=gemm_block(),
+        )
 
 
 @inline(.always)
@@ -612,6 +720,11 @@ def matmul_f4_dispatch_intel(
                 _launch_skinny_f4[c_type, F4_SKINNY_KS_NARROW](
                     ctx, cp, ap, bp, sp, m, n, k, f4_scale
                 )
+            return True
+        if m <= _wide_max_m(WIDE_MAX_M_F4):
+            _launch_wide[c_type, WIDE_NVFP4](
+                ctx, cp, ap, bp, sp, m, n, k, f4_scale
+            )
             return True
         # Widen B^T once to bfloat16 (values times their block scale /
         # 2**22), then the FP8 path's bfloat16 GEMM with the scale; the

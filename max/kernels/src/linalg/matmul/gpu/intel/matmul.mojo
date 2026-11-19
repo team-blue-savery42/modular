@@ -92,7 +92,12 @@ bfloat16 copy (`f8_widen_kernel`) and runs the bfloat16 GEMM on it with the
 same scaling (`gemm_kernel_f8_widened`): widening in the GEMM's registers
 repeats the work for every sub-group row of a work-group (2.5-4x the
 bfloat16 GEMM's time at M = 512 on the B70, against 1.2-1.75x this way).
-Shapes: `gemm_f8_supported` (K a multiple of 16 and at least 64).
+Up to M = 512 (K a multiple of 32), `gemm_kernel_wide` widens each K step
+of a work-group's B^T tile once into shared local memory instead, which
+skips the copy (0.44-0.92 of the widened time on the B70 there; FP4
+weights use it too, but their dispatch keeps the copy, see the dispatch's
+`WIDE_MAX_M_F8` and `WIDE_MAX_M_F4`). Shapes: `gemm_f8_supported` (K a
+multiple of 16 and at least 64).
 """
 
 from std.ffi import external_call
@@ -1380,3 +1385,336 @@ def f4_widen_kernel(
                     _e4m3_scale(scales.unsafe_load(w // 2)),
                 ),
             )
+
+
+comptime WIDE_F8 = 0
+"""`gemm_kernel_wide`'s B^T format: float8_e4m3fn, N x K bytes."""
+
+comptime WIDE_NVFP4 = 1
+"""`gemm_kernel_wide`'s B^T format: E2M1 codes (N x K / 2 bytes, low nibble
+first) with float8_e4m3fn scales per 16 values (N x K / 16 bytes)."""
+
+comptime WIDE_MXFP4 = 2
+"""`gemm_kernel_wide`'s B^T format: E2M1 codes with float8_e8m0fnu scales per
+32 values (N x K / 32 bytes)."""
+
+comptime _SLM_BLOCK_READ8 = "_Z27intel_sub_group_block_read8PU3AS3Kj"
+"""OpenCL's `intel_sub_group_block_read8(const local uint *)`
+(`cl_intel_subgroup_local_block_io`): lane l gets words l, l + 16, ..., l +
+112 of the 128 at the (16-byte aligned) address, in one message."""
+
+
+@inline(.always)
+def _slm_block_read8(
+    p: MutPointer[Scalar[DType.uint32], _, address_space=AddressSpace.SHARED],
+) -> SIMD[DType.uint32, 8]:
+    """`intel_sub_group_block_read8` of the 128 words at `p`."""
+    return external_call[_SLM_BLOCK_READ8, SIMD[DType.uint32, 8]](p)
+
+
+@inline(.always)
+def _wide_index(col: Int, w: Int) -> Int:
+    """Where word `w` (K pair `w`) of column `col` of a widened K step lies
+    in shared local memory: the 128 words of each 16-column block and K half
+    (`w // 8`) in `intel_sub_group_block_read8`'s order, word `w % 8` of
+    column `col % 16` at `16 * (w % 8) + col % 16`."""
+    return ((col // 16 * 2 + w // 8) * 8 + w % 8) * 16 + col % 16
+
+
+@inline(.always)
+def _f8_pairs(words: SIMD[DType.uint32, 4]) -> SIMD[DType.uint32, 8]:
+    """`_f8_to_bf16_pairs` for 4 words: the 8 words of bfloat16 pairs of
+    their 16 float8_e4m3fn values / 256."""
+    var lo = (words & 0xFF) | ((words & 0xFF00) << 8)
+    var hi = ((words >> 16) & 0xFF) | ((words >> 8) & 0xFF0000)
+    lo = ((lo & 0x00800080) << 8) | ((lo & 0x007F007F) << 7)
+    hi = ((hi & 0x00800080) << 8) | ((hi & 0x007F007F) << 7)
+    var lo32 = bitcast[DType.uint32, 8](
+        bitcast[DType.float16, 8](lo).cast[DType.float32]()
+    )
+    var hi32 = bitcast[DType.uint32, 8](
+        bitcast[DType.float16, 8](hi).cast[DType.float32]()
+    )
+    var lo_even, lo_odd = lo32.deinterleave()
+    var hi_even, hi_odd = hi32.deinterleave()
+    var lo_pair = (lo_even >> 16) | (lo_odd & 0xFFFF0000)
+    var hi_pair = (hi_even >> 16) | (hi_odd & 0xFFFF0000)
+    return lo_pair.interleave(hi_pair)
+
+
+@inline(.always)
+def _wide_load[
+    fmt: Int
+](
+    b: MutPointer[Scalar[DType.uint8], MutAnyOrigin],
+    scales: MutPointer[Scalar[DType.uint8], MutAnyOrigin],
+    row: Int,
+    half: Int,
+    k: Int,
+    kk: Int,
+) -> Tuple[SIMD[DType.uint32, 4], UInt32]:
+    """The bytes of K half `half` (16 values) of row `row` of B^T in the K
+    step at `kk`: FP8 4 words; FP4 2 words (the rest zero) and the half's
+    scale byte (NVFP4 its E4M3 block scale; MXFP4 the step's E8M0 one)."""
+    var bw = b.unsafe_bitcast[UInt32]()
+    var words = SIMD[DType.uint32, 4]()
+    var sc = UInt32(0)
+    comptime if fmt == WIDE_F8:
+        words = bw.unsafe_load[width=4]((row * k + kk + 16 * half) // 4)
+    else:
+        words = words.insert[offset=0](
+            bw.unsafe_load[width=2]((row * k + kk + 16 * half) // 8)
+        )
+        comptime if fmt == WIDE_NVFP4:
+            sc = scales.unsafe_load(row * (k // 16) + kk // 16 + half).cast[
+                DType.uint32
+            ]()
+        else:
+            sc = scales.unsafe_load(row * (k // 32) + kk // 32).cast[
+                DType.uint32
+            ]()
+    return (words, sc)
+
+
+@inline(.always)
+def _wide_store[
+    fmt: Int
+](
+    slm: MutPointer[Scalar[DType.uint32], _, address_space=AddressSpace.SHARED],
+    r: Int,
+    half: Int,
+    words: SIMD[DType.uint32, 4],
+    sc: UInt32,
+):
+    """Widens one half row (`_wide_load`) to its 8 words of bfloat16 pairs,
+    the scaled values of the widened paths (FP8: / 256; FP4: times the block
+    scale / 2**22), as words `8 * half` to `8 * half + 7` of column `r` of
+    `slm` (`_wide_index`)."""
+    var pairs: SIMD[DType.uint32, 8]
+    comptime if fmt == WIDE_F8:
+        pairs = _f8_pairs(words)
+    else:
+        var s: Float32
+        comptime if fmt == WIDE_NVFP4:
+            s = _e4m3_scale((sc & 0xFF).cast[DType.uint8]())
+        else:
+            s = _e8m0_scale((sc & 0xFF).cast[DType.uint8]())
+        pairs = _f4_word_to_bf16_pairs(words[0], s).join(
+            _f4_word_to_bf16_pairs(words[1], s)
+        )
+    comptime for j in range(8):
+        slm.unsafe_store(_wide_index(r, 8 * half + j), pairs[j])
+
+
+@inline(.always)
+def _prefetch_a[
+    wg_m: Int, sgs: Int
+](
+    a: MutPointer[Scalar[DType.bfloat16], MutAnyOrigin],
+    m: Int,
+    k: Int,
+    wm: Int,
+    sg: Int,
+    kp: Int,
+):
+    """Prefetches the work-group's A tile (`wg_m` x 32) of the K step at
+    `kp`, split over its `sgs` sub-groups in blocks of 8 rows x 32."""
+    comptime a_blocks = wg_m // 8
+    comptime for j in range(ceildiv(a_blocks, sgs)):
+        var i = sg + j * sgs
+        if i < a_blocks:
+            block_prefetch[16, 8, 2](a, k, m, k, kp, wm + 8 * i)
+
+
+comptime WIDE_PREFETCH = 2
+"""K steps ahead `gemm_kernel_wide` prefetches its B^T bytes."""
+
+
+@inline(.always)
+def _prefetch_b_wide[
+    fmt: Int, wg_n: Int, sgs: Int
+](
+    b: MutPointer[Scalar[DType.uint8], MutAnyOrigin],
+    n: Int,
+    k: Int,
+    wn: Int,
+    sg: Int,
+    kp: Int,
+):
+    """Prefetches the work-group's B^T bytes of the K step at `kp` (FP8 32
+    bytes a row, FP4 16) in blocks of 8 rows, as 16-bit elements."""
+    comptime if fmt == WIDE_F8:
+        var b16 = b.unsafe_bitcast[UInt16]()
+        comptime blocks = wg_n // 8
+        comptime for j in range(ceildiv(blocks, sgs)):
+            var i = sg + j * sgs
+            if i < blocks:
+                block_prefetch[16, 8, 2](
+                    b16, k // 2, n, k // 2, kp // 2, wn + 8 * i
+                )
+    else:
+        # 32 bytes cover two K steps: prefetch on even steps.
+        if (kp // K_STEP) % 2 == 0:
+            var b16 = b.unsafe_bitcast[UInt16]()
+            comptime blocks = wg_n // 8
+            comptime for j in range(ceildiv(blocks, sgs)):
+                var i = sg + j * sgs
+                if i < blocks:
+                    block_prefetch[16, 8, 2](
+                        b16, k // 4, n, k // 4, kp // 4, wn + 8 * i
+                    )
+
+
+def gemm_kernel_wide[
+    c_type: DType, fmt: Int, wg_n: Int = 256, kstep: Int = 1
+](
+    c: MutPointer[Scalar[c_type], MutAnyOrigin],
+    a: MutPointer[Scalar[DType.bfloat16], MutAnyOrigin],
+    b: MutPointer[Scalar[DType.uint8], MutAnyOrigin],
+    scales: MutPointer[Scalar[DType.uint8], MutAnyOrigin],
+    m: Int64,
+    n: Int64,
+    k: Int64,
+    scale: Float32,
+):
+    """`C = scale * A * B` for a bfloat16 A and an 8- or 4-bit B^T (`fmt`:
+    `WIDE_F8`, `WIDE_NVFP4`, `WIDE_MXFP4`; `scales` unread for FP8), K a
+    multiple of 32 (of 64 with `kstep` 2): the bfloat16 GEMM's 256 x `wg_n` work-group tiles of
+    32 x 64 sub-group tiles, with B^T widened once per K step and work-group
+    into shared local memory instead of a bfloat16 copy in device memory.
+
+    Per K step, work-item t loads half t % 2 of row t // 2 of the tile's
+    B^T (16 values: 16 or 8 bytes and its scale) a step ahead, while the
+    sub-groups multiply the current step, then widens it into the other of
+    two buffers; `kstep` steps per buffer and barrier. Each sub-group reads each packed B operand (lane l: column l
+    of a 16-column block, 8 words of K pairs per K half) with one
+    `intel_sub_group_block_read8` (`_wide_index`'s layout). `scale` is the weight scale times `F4_UNIT` for
+    FP4 (as the widened path), the weight scale for FP8. Launch
+    `gemm_grid[256, wg_n](m, n)` work-groups of `gemm_block[256, wg_n]()`.
+    """
+    comptime wg_m = 256
+    comptime sg_m = 32
+    comptime sg_n = 64
+    comptime group_m = 8
+    comptime sgs_n = wg_n // sg_n
+    comptime sgs = (wg_m // sg_m) * sgs_n
+    comptime rows = sg_m // 8
+    comptime cols = sg_n // 16
+    comptime assert sgs * 16 == 2 * wg_n, "half a row of B^T per work-item"
+    comptime assert kstep == 1 or kstep == 2, "kstep is 1 or 2"
+    comptime step_words = wg_n * 16
+    comptime buf = kstep * step_words
+    var mm = Int(m)
+    var nn = Int(n)
+    var kk = Int(k)
+
+    var grid_m = ceildiv(mm, wg_m)
+    var grid_n = ceildiv(nn, wg_n)
+    var pid = Int(block_idx.x)
+    var in_group = group_m * grid_n
+    var first_m = (pid // in_group) * group_m
+    var size_m = min(grid_m - first_m, group_m)
+    var pid_m = first_m + (pid % in_group) % size_m
+    var pid_n = (pid % in_group) // size_m
+    var wm = pid_m * wg_m
+    var wn = pid_n * wg_n
+
+    var t = Int(thread_idx.x)
+    var sg = t // 16
+    var lane = t % 16
+    var m0 = wm + (sg // sgs_n) * sg_m
+    var c0 = (sg % sgs_n) * sg_n
+    # Work-item t widens half t % 2 of row t // 2; rows past N read row
+    # N - 1 (their columns aren't stored).
+    var r_own = t // 2
+    var half = t % 2
+    var row = min(wn + r_own, nn - 1)
+
+    var slm = stack_allocation[
+        2 * buf, DType.uint32, address_space=AddressSpace.SHARED
+    ]()
+    var acc = stack_allocation[
+        rows * cols * 8, DType.float32, address_space=AddressSpace.LOCAL
+    ]()
+    comptime for i in range(rows * cols):
+        acc.unsafe_store(8 * i, SIMD[DType.float32, 8](0))
+
+    _prefetch_a[wg_m, sgs](a, mm, kk, wm, sg, 0)
+    comptime for pd in range(1, WIDE_PREFETCH + 1):
+        _prefetch_b_wide[fmt, wg_n, sgs](b, nn, kk, wn, sg, pd * K_STEP)
+    comptime for u in range(kstep):
+        var first = _wide_load[fmt](b, scales, row, half, kk, u * K_STEP)
+        _wide_store[fmt](slm + u * step_words, r_own, half, first[0], first[1])
+    barrier()
+
+    # `kstep` K steps of 32 per iteration and barrier.
+    var iters = kk // (kstep * K_STEP)
+    var it = 0
+    while True:
+        var more = it + 1 < iters
+        var k_it = it * kstep * K_STEP
+        var k_next = k_it + kstep * K_STEP
+        var nxt = SIMD[DType.uint32, 4 * kstep]()
+        var nsc = SIMD[DType.uint32, kstep]()
+        if more:
+            comptime for u in range(kstep):
+                var ld = _wide_load[fmt](
+                    b, scales, row, half, kk, k_next + u * K_STEP
+                )
+                nxt = nxt.insert[offset=4 * u](ld[0])
+                nsc[u] = ld[1]
+        var cur = slm + (it % 2) * buf
+        comptime for u in range(kstep):
+            var kc = k_it + u * K_STEP
+            if kc + K_STEP < kk:
+                _prefetch_a[wg_m, sgs](a, mm, kk, wm, sg, kc + K_STEP)
+            if kc + (1 + WIDE_PREFETCH) * K_STEP < kk:
+                _prefetch_b_wide[fmt, wg_n, sgs](
+                    b, nn, kk, wn, sg, kc + (1 + WIDE_PREFETCH) * K_STEP
+                )
+            # A rows as `_k_step` loads them.
+            var av = SIMD[DType.bfloat16, 2 * sg_m]()
+            var part = rebind[SIMD[DType.bfloat16, 2 * sg_m]](
+                block_load[16, sg_m, 2](a, kk, mm, kk, kc, m0)
+            )
+            comptime for h in range(2):
+                av = av.insert[offset=h * sg_m](
+                    part.slice[sg_m, offset=h * sg_m]()
+                )
+            var sub_buf = cur + u * step_words
+            var bps = SIMD[DType.uint32, 16 * cols]()
+            comptime for cb in range(cols):
+                comptime for h in range(2):
+                    bps = bps.insert[offset=8 * (2 * cb + h)](
+                        _slm_block_read8(
+                            sub_buf + _wide_index(c0 + 16 * cb, 8 * h)
+                        )
+                    )
+            comptime for cb in range(cols):
+                comptime for h in range(2):
+                    var bp = bps.slice[8, offset=8 * (2 * cb + h)]()
+                    comptime for r in range(rows):
+                        var af = av.slice[8, offset=h * sg_m + 8 * r]()
+                        comptime ai = 8 * (r * cols + cb)
+                        var d = SIMD[DType.float32, 8]()
+                        mma(d, af, bp, acc.unsafe_load[width=8](ai))
+                        acc.unsafe_store(ai, d)
+        if more:
+            var nbuf = slm + ((it + 1) % 2) * buf
+            comptime for u in range(kstep):
+                _wide_store[fmt](
+                    nbuf + u * step_words,
+                    r_own,
+                    half,
+                    nxt.slice[4, offset=4 * u](),
+                    nsc[u],
+                )
+        barrier()
+        it += 1
+        if it >= iters:
+            break
+
+    _scale_acc[True, rows * cols](acc, scale)
+    _store_tile[rows, cols, False, False](
+        c, acc, mm, nn, m0, wn + c0, no_epilogue_fn, no_compute_fn
+    )

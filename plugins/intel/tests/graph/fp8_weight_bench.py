@@ -19,12 +19,14 @@ Run on the GPU host with the plugin's launch profile on:
     utils/run-max-py tests/graph/fp8_weight_bench.py
 
 For each N x K (Gemma-4-26B-A4B's projections and 4096 x 4096) builds a
-graph of `COPIES` matmuls at M = 1 against distinct bf16 weights (so they
+graph of `COPIES` matmuls at M (argv[1], default 1) against distinct bf16 weights (so they
 stream from memory), once as `x @ w.T` and once through the per-tensor FP8
 quantization (graph ops on the weight, which MAX folds at load) and the
 Intel weight-only FP8 op, and runs each `RUNS` times (enough for the GPU's
 clocks to settle). The device times are in the profile, in case order.
 """
+
+import sys
 
 import numpy as np
 from max.driver import Accelerator, Buffer
@@ -34,6 +36,7 @@ from max.graph import DeviceRef, Graph, TensorType, Weight, ops
 from max.nn._graph_ops import _intel_weight_only_scaled_float8_matmul
 
 COPIES, RUNS = 8, 60
+M = int(sys.argv[1]) if len(sys.argv) > 1 else 1
 shapes = [
     (8192, 2816),
     (2816, 4096),
@@ -58,7 +61,7 @@ for n, k in shapes:
     for kind in ("bf16", "fp8"):
         with Graph(
             f"p_{kind}_{n}_{k}",
-            input_types=[TensorType(DType.bfloat16, [1, k], device=gpu)],
+            input_types=[TensorType(DType.bfloat16, [M, k], device=gpu)],
         ) as g:
             x = g.inputs[0].tensor
             outs = []
@@ -78,7 +81,7 @@ for n, k in shapes:
             g.output(*outs)
         reg = {f"w{c}": bf16(rng.uniform(-1, 1, (n, k))) for c in range(COPIES)}
         model = session.load(g, weights_registry=reg)
-        xb = bf16(rng.uniform(-1, 1, (1, k))).to(dev)
+        xb = bf16(rng.uniform(-1, 1, (M, k))).to(dev)
         for _ in range(RUNS):
             model.execute(xb)
         dev.synchronize()
