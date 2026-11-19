@@ -660,9 +660,12 @@ def matmul_f4_dispatch_intel(
         return True
 
 
-comptime F4_GROUPED_SG_M = 16
+comptime F4_GROUPED_SG_M = 32
 """Rows of A per DPAS tile of `grouped_kernel_f4` when the groups average
-more than one row (prefill); 8 otherwise (decode)."""
+more than 16 rows (prefill): on the B70 at gpt-oss-20b's 4096-token prompt
+(about 128 rows per expert), 32 rows took the gate and up projection 14.1 ms
+against 20.2 at 16 and 40.7 at 64 (spilled). 16 when they average more than
+one row, 8 otherwise (decode)."""
 
 
 @inline(.always)
@@ -838,6 +841,10 @@ def grouped_matmul_f4_dispatch_intel(
             # At most one row per group on average (decode): one DPAS row
             # block per tile.
             _grouped_f4_ks[c_type, 8, mx](
+                ctx, cp, ap, bp, sp, op, ip, xp, groups, n, k
+            )
+        elif m <= 16 * groups:
+            _grouped_f4_ks[c_type, 16, mx](
                 ctx, cp, ap, bp, sp, op, ip, xp, groups, n, k
             )
         else:
