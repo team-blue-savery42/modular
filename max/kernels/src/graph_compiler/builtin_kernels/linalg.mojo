@@ -70,6 +70,7 @@ from linalg.matmul.gpu.amd.smallm_streaming_matmul import (
 from linalg.matmul.gpu.apple.fp4_matmul import enqueue_apple_fp4_matmul
 from linalg.matmul.gpu.apple.fp8_gemv import enqueue_apple_fp8_matmul
 from linalg.matmul.gpu.intel import (
+    grouped_matmul_f4_dispatch_intel,
     matmul_f4_dispatch_intel,
     matmul_f8_dispatch_intel,
 )
@@ -2330,6 +2331,66 @@ struct Struct_matmul_weight_only_block_scaled_float4_intel:
                 "mo.matmul.weight.only.block.scaled.float4.intel: shape or"
                 " layout not supported (N a multiple of 8, N >= 32, K a"
                 " multiple of 64, K >= 128, row-major tensors)"
+            )
+
+
+@extensibility.register(
+    "mo.grouped.matmul.weight.only.block.scaled.float4.intel"
+)
+struct Struct_grouped_matmul_weight_only_block_scaled_float4_intel:
+    """Intel weight-only NVFP4 (W4A16) grouped matmul for MoE experts: for
+    each group z, `c[r0:r1] = (a[r0:r1] @ dequant(b[e])^T) *
+    expert_scales[e]`, `r0, r1 = expert_start[z], expert_start[z + 1]`, `e =
+    expert_ids[z]`.
+
+    The grouped form of `mo.matmul.weight.only.block.scaled.float4.intel`:
+    the activation stays bf16, each expert's packed E2M1 weight (`b`, `(E,
+    N, K / 2)`) is widened with its float8_e4m3fn block scales (`(E, N, K /
+    16)`) to bf16 in registers, and the expert's `weight_scale_2`
+    (`expert_scales`, `(E,)` float32 on the device) scales its float32
+    accumulators.
+    """
+
+    @inline(.always)
+    @staticmethod
+    def execute(
+        c: Some[Output & Tensor],
+        a: Some[Input & Tensor],
+        b: Some[Input & Tensor],
+        scales: Some[Input & Tensor],
+        expert_start: Some[Input & Tensor],
+        expert_ids: Some[Input & Tensor],
+        expert_scales: Some[Input & Tensor],
+        context: DeviceContext,
+    ) raises:
+        comptime assert conforms_to(type_of(c), TileTensorable)
+        comptime assert conforms_to(type_of(a), TileTensorable)
+        comptime assert conforms_to(type_of(b), TileTensorable)
+        comptime assert conforms_to(type_of(scales), TileTensorable)
+        comptime assert conforms_to(type_of(expert_start), TileTensorable)
+        comptime assert conforms_to(type_of(expert_ids), TileTensorable)
+        comptime assert conforms_to(type_of(expert_scales), TileTensorable)
+        comptime assert (
+            context.target.is_gpu()
+        ), "Intel weight-only NVFP4 grouped matmul only supports GPUs"
+        comptime assert context.default_device_info.api == "level_zero", (
+            "mo.grouped.matmul.weight.only.block.scaled.float4.intel requires"
+            " an Intel (Level Zero) GPU accelerator"
+        )
+        if not grouped_matmul_f4_dispatch_intel(
+            c.to_tile_tensor(),
+            a.to_tile_tensor[.bfloat16](),
+            b.to_tile_tensor[.uint8](),
+            scales.to_tile_tensor[.float8_e4m3fn](),
+            expert_start.to_tile_tensor[.uint32](),
+            expert_ids.to_tile_tensor[.int32](),
+            expert_scales.to_tile_tensor[.float32](),
+            context,
+        ):
+            raise Error(
+                "mo.grouped.matmul.weight.only.block.scaled.float4.intel:"
+                " shape or layout not supported (N even, a multiple of 8, N"
+                " >= 32, K a multiple of 64, K >= 128, row-major tensors)"
             )
 
 

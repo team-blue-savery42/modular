@@ -46,6 +46,7 @@ from max.nn.kernels import (
     grouped_matmul_block_scaled,
     grouped_matmul_ragged,
     grouped_quantize_dynamic_block_scaled,
+    intel_grouped_weight_only_nvfp4_matmul,
     intel_weight_only_nvfp4_matmul,
     layer_norm_quantize_dynamic_scaled_float8,
     quantize_dynamic_block_scaled,
@@ -1117,7 +1118,34 @@ def grouped_matmul(
             kernel; 0 disables. Ignored elsewhere.
         expert_scales: The NVFP4 branch's precomputed
             ``weight_scale_2 * input_scale`` on the device; ``None`` derives it.
+            Unused on Intel Xe2, whose weight-only kernel takes
+            ``weight_scale_2`` alone.
     """
+    if (
+        isinstance(weight, NVFP4Tensor)
+        and isinstance(x, Tensor)
+        and _is_intel_xe2_gpu()
+    ):
+        # Intel Xe2 weight-only (W4A16), as `_matmul_nvfp4`: the activation
+        # stays bf16 and `input_scale` cancels. The kernel widens each
+        # expert's weight with its [E, N, K // 16] block scales in registers
+        # and applies its `weight_scale_2` to the float32 accumulators; it
+        # reads each group's rows on the device, so neither the usage stats
+        # nor `scales_offset` is used. Gated on Intel Xe2: no other target
+        # changes.
+        if len(weight.weight_scale.shape) != 3:
+            raise ValueError(
+                "Intel NVFP4 grouped matmul takes [E, N, K // 16] block"
+                " scales, not the interleaved kernel layout"
+            )
+        return intel_grouped_weight_only_nvfp4_matmul(
+            x,
+            weight.weight,
+            weight.weight_scale,
+            expert_start_indices,
+            expert_ids,
+            weight.weight_scale_2,
+        )
     if isinstance(weight, NVFP4Tensor):
         if isinstance(x, NVFP4Activation):
             x_fp4, x_scales = x.data, x.scales

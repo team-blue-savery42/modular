@@ -67,6 +67,9 @@ from max.nn._graph_ops import (
     grouped_quantize_dynamic_block_scaled as _grouped_quantize_dynamic_block_scaled,
 )
 from max.nn._graph_ops import (
+    intel_grouped_weight_only_nvfp4_matmul as _intel_grouped_nvfp4_matmul,
+)
+from max.nn._graph_ops import (
     layer_norm_quantize_dynamic_scaled_float8 as _layer_norm_quantize_dynamic_scaled_float8,
 )
 from max.nn._graph_ops import (
@@ -450,6 +453,11 @@ block_scales_interleave = F.functional(
 intel_weight_only_nvfp4_matmul = F.functional(_intel_nvfp4_matmul)
 """Intel Xe2 weight-only NVFP4 matmul (bf16 activation). No sharding rule:
 call it on single-device tensors."""
+intel_grouped_weight_only_nvfp4_matmul = F.functional(
+    _intel_grouped_nvfp4_matmul
+)
+"""Intel Xe2 weight-only NVFP4 grouped (MoE) matmul (bf16 activation). No
+sharding rule: call it on single-device tensors."""
 dynamic_block_scaled_matmul = F.functional(
     _dynamic_block_scaled_matmul, rule=_nvfp4_matmul_rule
 )

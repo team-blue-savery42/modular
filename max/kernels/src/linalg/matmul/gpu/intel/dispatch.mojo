@@ -56,6 +56,7 @@ from .matmul import (
     F4_WIDEN_WORDS,
     f4_widen_kernel,
     gemm_f4_supported,
+    grouped_kernel_f4,
     skinny_kernel_f4,
     SKINNY_MAX_M,
     SKINNY_WIDE_MAX_M,
@@ -656,4 +657,184 @@ def matmul_f4_dispatch_intel(
                 block_dim=gemm_block(),
             )
         _ = wide^
+        return True
+
+
+comptime F4_GROUPED_SG_M = 16
+"""Rows of A per DPAS tile of `grouped_kernel_f4` when the groups average
+more than one row (prefill); 8 otherwise (decode)."""
+
+
+@inline(.always)
+def _launch_grouped_f4[
+    c_type: DType, ks: Int, sg_m: Int
+](
+    ctx: DeviceContext,
+    c: MutPointer[Scalar[c_type], MutAnyOrigin],
+    a: MutPointer[Scalar[DType.bfloat16], MutAnyOrigin],
+    b: MutPointer[Scalar[DType.uint8], MutAnyOrigin],
+    scales: MutPointer[Scalar[DType.uint8], MutAnyOrigin],
+    a_offsets: MutPointer[Scalar[DType.uint32], MutAnyOrigin],
+    expert_ids: MutPointer[Scalar[DType.int32], MutAnyOrigin],
+    expert_scales: MutPointer[Scalar[DType.float32], MutAnyOrigin],
+    groups: Int,
+    n: Int,
+    k: Int,
+) raises:
+    """Launches `grouped_kernel_f4` with `ks` sub-groups per work-group and
+    `sg_m` rows of A per DPAS tile over `groups` groups."""
+    comptime kern = grouped_kernel_f4[c_type, sg_m=sg_m, ks=ks]
+    ctx.enqueue_function[kern](
+        c,
+        a,
+        b,
+        scales,
+        a_offsets,
+        expert_ids,
+        expert_scales,
+        Int64(n),
+        Int64(k),
+        grid_dim=(skinny_grid(n), groups),
+        block_dim=skinny_block[ks](),
+    )
+
+
+@inline(.always)
+def _grouped_f4_ks[
+    c_type: DType, sg_m: Int
+](
+    ctx: DeviceContext,
+    c: MutPointer[Scalar[c_type], MutAnyOrigin],
+    a: MutPointer[Scalar[DType.bfloat16], MutAnyOrigin],
+    b: MutPointer[Scalar[DType.uint8], MutAnyOrigin],
+    scales: MutPointer[Scalar[DType.uint8], MutAnyOrigin],
+    a_offsets: MutPointer[Scalar[DType.uint32], MutAnyOrigin],
+    expert_ids: MutPointer[Scalar[DType.int32], MutAnyOrigin],
+    expert_scales: MutPointer[Scalar[DType.float32], MutAnyOrigin],
+    groups: Int,
+    n: Int,
+    k: Int,
+) raises:
+    """`_launch_grouped_f4` with the dense FP4 kernel's K split for N."""
+    if n > F4_SKINNY_SPLIT_N:
+        _launch_grouped_f4[c_type, F4_SKINNY_KS_WIDE, sg_m](
+            ctx,
+            c,
+            a,
+            b,
+            scales,
+            a_offsets,
+            expert_ids,
+            expert_scales,
+            groups,
+            n,
+            k,
+        )
+    else:
+        _launch_grouped_f4[c_type, F4_SKINNY_KS_NARROW, sg_m](
+            ctx,
+            c,
+            a,
+            b,
+            scales,
+            a_offsets,
+            expert_ids,
+            expert_scales,
+            groups,
+            n,
+            k,
+        )
+
+
+@inline(.always)
+def grouped_matmul_f4_dispatch_intel(
+    c: TileTensor[mut=True, ...],
+    a: TileTensor[DType.bfloat16, ...],
+    b: TileTensor[DType.uint8, ...],
+    scales: TileTensor[DType.float8_e4m3fn, ...],
+    a_offsets: TileTensor[DType.uint32, ...],
+    expert_ids: TileTensor[DType.int32, ...],
+    expert_scales: TileTensor[DType.float32, ...],
+    ctx: DeviceContext,
+) raises -> Bool:
+    """Runs the grouped (MoE) weight-only NVFP4 matmul `c[r0:r1] =
+    expert_scales[e] * a[r0:r1] @ dequant(b[e])^T` for each group z (`r0,
+    r1 = a_offsets[z], a_offsets[z + 1]`, `e = expert_ids[z]`) with
+    `grouped_kernel_f4` and returns True, or returns False, launching
+    nothing, when the target, layouts or shape aren't the kernel's.
+
+    Args:
+        c: Output, `(M, N)`, bfloat16 or float32; rows of empty groups and
+            of groups whose expert id is below 0 are not written.
+        a: `(M, K)`, bfloat16, rows grouped by expert.
+        b: `(E, N, K / 2)`, packed E2M1 codes.
+        scales: `(E, N, K / 16)`, float8_e4m3fn block scales.
+        a_offsets: `(G + 1,)`, each group's first row, then M.
+        expert_ids: `(G,)`, each group's expert.
+        expert_scales: `(E,)`, each expert's weight scale (NVFP4's
+            `weight_scale_2`), on the device.
+        ctx: Device context to launch on.
+
+    Returns:
+        Whether the matmul was launched.
+    """
+    comptime info = ctx.default_device_info
+    comptime c_type = c.dtype
+    comptime taken = (
+        info.api == "level_zero"
+        and info.version == "xe2"
+        and info.warp_size == 16
+        and (c_type == DType.float32 or c_type == DType.bfloat16)
+        and c.address_space == AddressSpace.GENERIC
+        and a.address_space == AddressSpace.GENERIC
+        and b.address_space == AddressSpace.GENERIC
+        and scales.address_space == AddressSpace.GENERIC
+    )
+    comptime if not taken:
+        return False
+    else:
+        var m = Int(c.dim[0]())
+        var n = Int(c.dim[1]())
+        var k = Int(a.dim[1]())
+        var experts = Int(b.dim[0]())
+        var groups = Int(expert_ids.dim[0]())
+        # Each expert's B^T and scales start 64-byte aligned for the block
+        # loads and the aligned scale loads: N * K / 2 and N * K / 16 bytes
+        # apart (K a multiple of 64, N even).
+        if not (
+            gemm_f4_supported[c_type](max(m, 1), n, k)
+            and n % 2 == 0
+            and Int(b.dim[1]()) == n
+            and Int(b.dim[2]()) * 2 == k
+            and Int(scales.dim[0]()) == experts
+            and Int(scales.dim[1]()) == n
+            and Int(scales.dim[2]()) * 16 == k
+            and Int(a_offsets.dim[0]()) == groups + 1
+            and Int(expert_scales.dim[0]()) == experts
+            and Int(c.layout.stride[1]().value()) == 1
+            and Int(c.layout.stride[0]().value()) == n
+            and _row_major(a)
+            and Int(_raw(b)) % 64 == 0
+            and Int(_raw(scales)) % 64 == 0
+        ):
+            return False
+        if m == 0 or groups == 0:
+            return True
+        var cp = _raw(c)
+        var ap = _raw(a)
+        var bp = _raw(b)
+        var sp = _raw(scales).unsafe_bitcast[UInt8]()
+        var op = _raw(a_offsets)
+        var ip = _raw(expert_ids)
+        var xp = _raw(expert_scales)
+        if m <= groups:
+            # At most one row per group on average (decode): one DPAS row
+            # block per tile.
+            _grouped_f4_ks[c_type, 8](
+                ctx, cp, ap, bp, sp, op, ip, xp, groups, n, k
+            )
+        else:
+            _grouped_f4_ks[c_type, F4_GROUPED_SG_M](
+                ctx, cp, ap, bp, sp, op, ip, xp, groups, n, k
+            )
         return True

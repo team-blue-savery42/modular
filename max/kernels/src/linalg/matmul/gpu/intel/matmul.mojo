@@ -1249,6 +1249,75 @@ def skinny_kernel_f4[
     )
 
 
+def grouped_kernel_f4[
+    c_type: DType,
+    sg_m: Int = 16,
+    sg_n: Int = SKINNY_SG_N,
+    ks: Int = skinny_ks[True](),
+](
+    c: MutPointer[Scalar[c_type], MutAnyOrigin],
+    a: MutPointer[Scalar[DType.bfloat16], MutAnyOrigin],
+    b: MutPointer[Scalar[DType.uint8], MutAnyOrigin],
+    scales: MutPointer[Scalar[DType.uint8], MutAnyOrigin],
+    a_offsets: MutPointer[Scalar[DType.uint32], MutAnyOrigin],
+    expert_ids: MutPointer[Scalar[DType.int32], MutAnyOrigin],
+    expert_scales: MutPointer[Scalar[DType.float32], MutAnyOrigin],
+    n: Int64,
+    k: Int64,
+):
+    """The grouped (MoE) form of `skinny_kernel_f4`: for each group z,
+    `C[r0:r1] = expert_scales[e] * A[r0:r1] * B[e]` with `r0, r1 =
+    a_offsets[z], a_offsets[z + 1]` and `e = expert_ids[z]`, B[e] the
+    expert's FP4 B^T (N x K / 2 bytes of E2M1 codes, N x K / 16 E4M3 block
+    scales, experts packed one after another). Groups with no rows or an
+    expert id below 0 store nothing. Launched with `skinny_grid(n)` x groups
+    work-groups of `skinny_block[ks]()`: work-group (x, z) takes columns
+    `x * sg_n` of group z, `sg_m` rows at a time."""
+    comptime rows = sg_m // 8
+    comptime cols = sg_n // 16
+    var z = Int(block_idx.y)
+    var expert = Int(expert_ids[z])
+    var r0 = Int(a_offsets[z])
+    var r1 = Int(a_offsets[z + 1])
+    # Uniform over the work-group, so no barrier is skipped by part of it.
+    if expert < 0 or r1 <= r0:
+        return
+    var nn = Int(n)
+    var kk = Int(k)
+    var be = b + expert * nn * (kk // 2)
+    var se = scales + expert * nn * (kk // 16)
+    var sg = Int(thread_idx.x) // 16
+    var n0 = Int(block_idx.x) * sg_n
+    var scale = expert_scales[expert] * F4_UNIT
+    var steps = kk // F4_K_STEP
+    var acc = stack_allocation[
+        rows * cols * 8, DType.float32, address_space=AddressSpace.LOCAL
+    ]()
+    var m0 = r0
+    while m0 < r1:
+        # A and C from row m0: the block loads see r1 - m0 rows (zeros
+        # past them) and the store skips rows past them.
+        var am = a + m0 * kk
+        var cm = c + m0 * nn
+        var m = r1 - m0
+        comptime for i in range(rows * cols):
+            acc.unsafe_store(8 * i, SIMD[DType.float32, 8](0))
+        var s = sg
+        while s < steps:
+            _k_step_f4[sg_m, sg_n](
+                acc, am, be, se, m, nn, kk, s * F4_K_STEP, n0
+            )
+            s += ks
+        _scale_acc[True, rows * cols](acc, scale)
+        _skinny_store[rows, cols, ks, False, False](
+            cm, acc, m, nn, n0, no_epilogue_fn, no_compute_fn
+        )
+        comptime if ks > 1:
+            # The next tile's store reuses the reduction's shared memory.
+            barrier()
+        m0 += sg_m
+
+
 comptime F4_WIDEN_WORDS = 4
 """Words of 8 E2M1 codes `f4_widen_kernel` widens per work-item."""
 

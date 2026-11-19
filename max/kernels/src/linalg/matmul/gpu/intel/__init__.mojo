@@ -18,6 +18,7 @@ SIMT GEMM on the GPUs without DPAS."""
 
 from .dispatch import (
     matmul_dispatch_intel,
+    grouped_matmul_f4_dispatch_intel,
     matmul_f4_dispatch_intel,
     matmul_f8_dispatch_intel,
 )

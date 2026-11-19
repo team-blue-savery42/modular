@@ -14855,6 +14855,64 @@ def _intel_weight_only_block_scaled_float4_matmul(
     )[0].tensor
 
 
+def intel_grouped_weight_only_nvfp4_matmul(
+    a: TensorValue,
+    b: TensorValue,
+    b_scales: TensorValue,
+    expert_start: TensorValue,
+    expert_ids: TensorValue,
+    expert_scales: TensorValue,
+) -> TensorValue:
+    """Intel weight-only NVFP4 (W4A16) grouped matmul for MoE experts.
+
+    For each group ``z``, rows ``expert_start[z]`` to ``expert_start[z + 1]``
+    of the result are ``(a[rows] @ dequant(b[e]).T) * expert_scales[e]`` with
+    ``e = expert_ids[z]``. Rows of empty groups are not written.
+
+    Args:
+        a: The bf16 activation, ``[M, K]``, rows grouped by expert.
+        b: The packed E2M1 weights, uint8 ``[E, N, K // 2]``, low nibble
+            first.
+        b_scales: The float8_e4m3fn block scales, ``[E, N, K // 16]``.
+        expert_start: uint32 ``[G + 1]``, each group's first row, then M
+            (``moe_create_indices``).
+        expert_ids: int32 ``[G]``, each group's expert.
+        expert_scales: float32 ``[E]``, each expert's ``weight_scale_2``.
+
+    Returns:
+        The result in ``bfloat16``, shape ``[M, N]``.
+    """
+    if a.rank != 2 or b.rank != 3 or b_scales.rank != 3:
+        raise ValueError("a must be rank 2, b and b_scales rank 3")
+    if a.dtype != DType.bfloat16:
+        raise ValueError(f"activation a must be bfloat16, got {a.dtype}")
+    if b.dtype != DType.uint8:
+        raise ValueError(f"weight b must be uint8 (packed E2M1), got {b.dtype}")
+    if b_scales.dtype != DType.float8_e4m3fn:
+        raise ValueError(
+            f"b_scales must be float8_e4m3fn, got {b_scales.dtype}"
+        )
+    return ops.custom(
+        "mo.grouped.matmul.weight.only.block.scaled.float4.intel",
+        device=a.device,
+        values=[
+            a,
+            b,
+            b_scales,
+            ops.cast(expert_start, DType.uint32),
+            ops.cast(expert_ids, DType.int32),
+            ops.cast(expert_scales, DType.float32).reshape([-1]).to(a.device),
+        ],
+        out_types=[
+            TensorType(
+                dtype=DType.bfloat16,
+                shape=[a.shape[0], b.shape[1]],
+                device=a.device,
+            )
+        ],
+    )[0].tensor
+
+
 def _intel_weight_only_scaled_float8_matmul(
     a: TensorValue,
     b: TensorValue,
